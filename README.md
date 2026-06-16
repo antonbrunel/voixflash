@@ -96,9 +96,9 @@ Tout le reste (comportement du presse-papiers, limites, historique…) est déta
 
 | Réglage | Détail |
 |---|---|
-| **Qualité / vitesse** | Rapide (tiny) → Très précis (medium). Défaut : **Précis (small)**. |
-| **Langue** | Français (défaut) ou Anglais. |
-| **Touche de dictée** | Option droite (défaut), Cmd droite, Ctrl droite, F5. |
+| **Qualité / vitesse** | Rapide (tiny) → Très précis (medium). Défaut : **Précis (small)**. Le **1er choix** d'une qualité télécharge le modèle une fois (jusqu'à ~1 min ; un message le signale), puis c'est hors-ligne. |
+| **Langue** | **Français** (défaut), **Anglais**, ou **Automatique** (détecte la langue à chaque dictée — idéal pour alterner FR/EN). |
+| **Touche de dictée** | Préréglages (Option droite par défaut, Cmd droite, Ctrl droite, F5) **ou « Choisir ma touche… »** : appuie sur la touche que tu veux, elle est captée telle quelle (fiable quel que soit le clavier). |
 | **Réunions › Horodatage** | Ajoute `[mm:ss]` devant chaque passage. |
 | **Restaurer le presse-papiers** | Remet ton ancien presse-papiers après une dictée (activé). |
 
