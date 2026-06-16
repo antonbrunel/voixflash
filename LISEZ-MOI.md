@@ -79,13 +79,16 @@ pastille d'enregistrement = enregistre · forme d'onde = transcrit · presse-pap
 ## 4. Réglages (menu de l'icône)
 
 - **Qualité / vitesse** : *Rapide (tiny)* → *Très précis (medium)*. Défaut : **Précis (small)**.
-- **Langue** : **Français** (défaut) ou **Anglais**.
-- **Touche de dictée** : Option droite (défaut), Cmd droite, Ctrl droite ou F5.
+- **Langue** : **Français** (défaut), **Anglais**, ou **Automatique** (détecte la langue
+  à chaque dictée — pratique pour alterner FR/EN).
+- **Touche de dictée** : préréglages (Option droite par défaut…) ou **« Choisir ma touche… »**
+  qui capte la touche que tu presses (fiable quel que soit le clavier).
 - **Réunions › Horodatage des passages** : ajoute `[mm:ss]` devant chaque passage.
 - **Restaurer le presse-papiers après une dictée** : remet ton ancien presse-papiers (activé).
 
-> Changer la qualité pour *medium* la première fois nécessite internet le temps de
-> télécharger ce modèle ; ensuite c'est hors-ligne.
+> Le **1er choix** d'une qualité télécharge le modèle une fois (jusqu'à ~1 min pour
+> *medium*, ~1,5 Go ; un message le signale). L'icône micro se remplit quand c'est prêt.
+> Ensuite, tout est hors-ligne.
 
 ---
 

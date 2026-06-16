@@ -55,6 +55,7 @@ except Exception:
 #  Chemins & constantes
 # --------------------------------------------------------------------------- #
 APP_NAME = "VoixFlash"
+APP_VERSION = "1.1.0"
 LAUNCHD_LABEL = "com.voixflash.agent"   # étiquette du LaunchAgent (cf. install.command)
 APP_HOME = os.path.expanduser(f"~/Library/Application Support/{APP_NAME}")
 CONFIG_PATH = os.path.join(APP_HOME, "config.json")
@@ -84,8 +85,9 @@ os.makedirs(TRANSCRIPTS_DIR, exist_ok=True)
 # Réglages par défaut (modifiables depuis le menu, sauvegardés dans config.json).
 DEFAULT_CONFIG = {
     "hotkey": "alt_r",            # touche de dictée éclair = Option (alt) droite
+    "hotkey_label": "Option droite",  # libellé lisible de la touche (affichage)
     "model": "small",            # qualité/vitesse de transcription (défaut équilibré)
-    "language": "fr",            # langue : "fr" ou "en"
+    "language": "fr",            # langue : "fr", "en", ou "auto" (détection automatique)
     "meeting_timestamps": False,  # ajouter [mm:ss] devant chaque passage des réunions
     "restore_clipboard": True,    # remettre l'ancien presse-papiers après le collage
     "beam_size": 5,              # qualité du décodage (5 = bon compromis)
@@ -173,26 +175,90 @@ def fmt_ts(seconds):
 
 
 def parse_hotkey(s):
-    """Transforme une chaîne de config ('alt_r', 'f5', 'a'...) en touche pynput."""
-    s = (s or "").strip().lower()
-    if hasattr(keyboard.Key, s):                # touche spéciale (alt_r, f5, cmd_r...)
-        return getattr(keyboard.Key, s)
+    """Transforme une valeur de config en touche pynput. Formats acceptés :
+      - 'vk:50'   → touche par CODE PHYSIQUE (le plus fiable, indépendant du clavier)
+      - 'char:²'  → touche par caractère
+      - 'alt_r', 'f5', 'cmd_r'… → touche nommée (préréglages)
+      - 'a'       → caractère unique (compatibilité ancienne config)"""
+    s = (s or "").strip()
+    if s.startswith("vk:"):
+        try:
+            return keyboard.KeyCode.from_vk(int(s[3:]))
+        except Exception:
+            return keyboard.Key.alt_r
+    if s.startswith("char:"):
+        c = s[5:]
+        return keyboard.KeyCode.from_char(c) if c else keyboard.Key.alt_r
+    low = s.lower()
+    if hasattr(keyboard.Key, low):              # touche spéciale (alt_r, f5, cmd_r...)
+        return getattr(keyboard.Key, low)
     if len(s) == 1:                             # touche caractère normale
         return keyboard.KeyCode.from_char(s)
     return keyboard.Key.alt_r                   # repli sûr : Option droite
 
 
+def serialize_hotkey(key):
+    """Transforme une touche pynput captée en chaîne stockable dans la config.
+    On privilégie le CODE PHYSIQUE (vk) : il identifie la touche par sa position,
+    sans dépendre de la disposition clavier ni du fait que la touche produise ou
+    non un caractère — c'est ce qui évite les soucis du type Option droite vue
+    comme « alt_r » sur un Mac et « alt_gr » sur un autre."""
+    try:
+        if isinstance(key, keyboard.Key):
+            return key.name                      # touche nommée (alt_r, f5, alt_gr…)
+        vk = getattr(key, "vk", None)
+        if vk is not None:
+            return f"vk:{vk}"
+        ch = getattr(key, "char", None)
+        if ch:
+            return f"char:{ch}"
+    except Exception:
+        pass
+    return None
+
+
 def key_matches(key, target):
-    """Compare une touche reçue à la touche de dictée configurée."""
+    """Compare une touche reçue à la touche de dictée configurée. On compare en
+    priorité le CODE PHYSIQUE (vk) : robuste quelle que soit la disposition."""
     try:
         if isinstance(target, keyboard.Key):
             return key == target
-        # KeyCode (touche caractère) : on compare le caractère
-        if getattr(key, "char", None) is not None and getattr(target, "char", None) is not None:
-            return key.char == target.char
+        # target est un KeyCode (touche capturée). On compare d'abord par vk.
+        tvk = getattr(target, "vk", None)
+        kvk = getattr(key, "vk", None)
+        if tvk is not None and kvk is not None:
+            return kvk == tvk
+        tchar = getattr(target, "char", None)
+        kchar = getattr(key, "char", None)
+        if tchar is not None and kchar is not None:
+            return kchar == tchar
         return key == target
     except Exception:
         return False
+
+
+def hotkey_display(key):
+    """Libellé lisible (français) pour une touche pynput captée."""
+    named = {
+        "alt_r": "Option droite", "alt_l": "Option gauche", "alt": "Option",
+        "alt_gr": "Option droite (AltGr)",
+        "cmd_r": "Cmd droite", "cmd_l": "Cmd gauche", "cmd": "Cmd",
+        "ctrl_r": "Ctrl droite", "ctrl_l": "Ctrl gauche", "ctrl": "Ctrl",
+        "shift_r": "Maj droite", "shift_l": "Maj gauche", "shift": "Maj",
+        "space": "Espace", "tab": "Tabulation", "caps_lock": "Verr. Maj",
+    }
+    try:
+        if isinstance(key, keyboard.Key):
+            return named.get(key.name, key.name.replace("_", " ").upper())
+        ch = getattr(key, "char", None)
+        if ch and ch.strip():
+            return f"« {ch} »"
+        vk = getattr(key, "vk", None)
+        if vk is not None:
+            return f"touche (code {vk})"
+    except Exception:
+        pass
+    return "touche"
 
 
 # Sur du silence ou du bruit, Whisper « hallucine » des phrases parasites récurrentes
@@ -212,6 +278,29 @@ def is_probably_hallucination(text):
     """True si le texte se résume à une phrase parasite connue de Whisper (silence)."""
     t = " ".join((text or "").lower().split())
     return bool(t) and any(marker in t for marker in HALLUCINATION_MARKERS)
+
+
+def model_is_cached(name):
+    """True si le modèle faster-whisper « name » est DÉJÀ téléchargé (cache Hugging
+    Face) → son chargement sera rapide, sans réseau. False = 1er usage = téléchargement
+    (potentiellement long). Sert à prévenir l'utilisateur uniquement quand c'est utile."""
+    try:
+        base = (os.environ.get("HF_HUB_CACHE")
+                or os.environ.get("HUGGINGFACE_HUB_CACHE"))
+        if not base:
+            hf_home = os.environ.get("HF_HOME")
+            base = os.path.join(hf_home, "hub") if hf_home else \
+                os.path.expanduser("~/.cache/huggingface/hub")
+        snap = os.path.join(base, f"models--Systran--faster-whisper-{name}", "snapshots")
+        if not os.path.isdir(snap):
+            return False
+        # Le modèle n'est « complet » que si un instantané contient model.bin.
+        for d in os.listdir(snap):
+            if os.path.isfile(os.path.join(snap, d, "model.bin")):
+                return True
+        return False
+    except Exception:
+        return False
 
 
 def accessibility_trusted():
@@ -420,11 +509,14 @@ class VoixFlashApp(rumps.App):
 
         # État interne
         self.model = None                 # le moteur de transcription, chargé en fond
-        self.model_name_loaded = None
+        self.model_name_loaded = None     # nom du modèle actuellement en mémoire
+        self._requested_model = self.config["model"]  # dernier modèle DEMANDÉ (le plus récent gagne)
         self._state = "loading"
         self._recording = False
         self._record_mode = None          # "flash" ou "meeting"
         self._ptt_active = False          # touche de dictée actuellement maintenue ?
+        self._capturing = False           # en train de capturer une nouvelle touche ?
+        self._captured = None             # dernière touche captée pendant la capture
         self._stream = None               # flux audio en cours
         self._frames = []                 # morceaux audio enregistrés
         self._record_sr = 16000           # fréquence d'échantillonnage utilisée
@@ -537,17 +629,29 @@ class VoixFlashApp(rumps.App):
 
     def _refresh_lang_menu(self):
         self._safe_clear(self.lang_menu)
-        for label, val in [("Français", "fr"), ("Anglais", "en")]:
+        for label, val in [("Français", "fr"), ("Anglais", "en"), ("Automatique (détection)", "auto")]:
             item = rumps.MenuItem(label, callback=self._make_lang_cb(val))
             item.state = (self.config["language"] == val)
             self.lang_menu.add(item)
 
     def _refresh_hotkey_menu(self):
         self._safe_clear(self.hotkey_menu)
+        current = self.config.get("hotkey", "alt_r")
+        is_preset = any(current == v for _, v in HOTKEY_CHOICES)
         for label, val in HOTKEY_CHOICES:
             item = rumps.MenuItem(label, callback=self._make_hotkey_cb(val))
-            item.state = (self.config["hotkey"] == val)
+            item.state = (current == val)
             self.hotkey_menu.add(item)
+        self.hotkey_menu.add(rumps.separator)
+        # « Choisir ma touche… » : capture la prochaine touche pressée. Coché si la
+        # touche active est une touche personnalisée (donc hors préréglages).
+        if is_preset:
+            cap_title = "Choisir ma touche…"
+        else:
+            cap_title = f"Ma touche : {self._current_hotkey_label()}  (changer…)"
+        cap = rumps.MenuItem(cap_title, callback=self.start_hotkey_capture)
+        cap.state = not is_preset
+        self.hotkey_menu.add(cap)
 
     def _refresh_history_menu(self):
         """Reconstruit le sous-menu d'historique : entrées récentes cliquables (→ fenêtre
@@ -571,12 +675,36 @@ class VoixFlashApp(rumps.App):
         self.history_menu.add(rumps.MenuItem("Vider l'historique…", callback=self.clear_history))
 
     # ------------------------------------------------- fabriques de callbacks --
+    def _model_label(self, val):
+        for label, v in MODEL_CHOICES:
+            if v == val:
+                return label
+        return val
+
     def _make_quality_cb(self, val):
         def cb(_sender):
             self.config["model"] = val
             save_json(CONFIG_PATH, self.config)
             self._refresh_quality_menu()
-            threading.Thread(target=self._load_model, daemon=True).start()
+            # On note le DERNIER modèle demandé : si on reclique vite sur un autre, le
+            # chargement en cours sera ignoré à la fin (le plus récent gagne), et on
+            # évite d'écraser self.model par un modèle obsolète ou d'empiler des alertes.
+            with self._lock:
+                self._requested_model = val
+            # Si le modèle n'est pas encore téléchargé, on prévient : c'est l'attente
+            # « longue » (jusqu'à ~1 min) qui surprenait. Sinon (déjà en cache), le
+            # chargement est rapide et l'icône suffit comme retour.
+            if not model_is_cached(val):
+                self._present(
+                    self._show_info, "Téléchargement du modèle",
+                    f"Le modèle « {self._model_label(val)} » se télécharge (1re fois, "
+                    "jusqu'à ~1 min selon ta connexion). L'icône micro se remplit quand "
+                    "c'est prêt — tu peux continuer à travailler. Ensuite, c'est hors-ligne.")
+            # On passe le nom explicitement (pas via la config, qui peut changer) et
+            # announce=True : on confirme « prêt » à la fin (changement demandé par
+            # l'utilisateur ; au démarrage on reste muet).
+            threading.Thread(target=self._load_model, kwargs={"name": val, "announce": True},
+                             daemon=True).start()
         return cb
 
     def _make_lang_cb(self, val):
@@ -594,7 +722,9 @@ class VoixFlashApp(rumps.App):
             # déjà TOUTES les touches et les compare à self._hotkey à chaque appui. Il
             # suffit donc de changer la cible « à chaud ».
             try:
+                label = self._hotkey_label(val)
                 self.config["hotkey"] = val
+                self.config["hotkey_label"] = label
                 save_json(CONFIG_PATH, self.config)
                 self._hotkey = parse_hotkey(val)
                 self._ptt_active = False
@@ -603,7 +733,7 @@ class VoixFlashApp(rumps.App):
                 # bundle) : on ouvre l'alerte au tour de boucle suivant pour ne pas la
                 # déclencher pendant que le menu est encore en cours de fermeture.
                 self._present(self._show_info, "Touche changée",
-                              f"Dictée éclair : {self._hotkey_label(val)}")
+                              f"Dictée éclair : {label}")
             except Exception as e:
                 log(f"changement de touche : {e}")
         return cb
@@ -613,6 +743,71 @@ class VoixFlashApp(rumps.App):
             if v == val:
                 return label
         return val
+
+    def _current_hotkey_label(self):
+        """Libellé de la touche de dictée ACTUELLE (préréglage ou touche capturée)."""
+        val = self.config.get("hotkey", "alt_r")
+        for label, v in HOTKEY_CHOICES:
+            if v == val:
+                return label
+        return self.config.get("hotkey_label") or val
+
+    def start_hotkey_capture(self, _sender):
+        """« Appuie sur ta touche » : capture la prochaine touche pressée et en fait la
+        touche de dictée. Comme on capte ce que CE clavier émet réellement, la touche
+        correspondra toujours ensuite (fini les soucis Option droite = alt_r ou alt_gr
+        selon la machine). Si rien n'est capté, c'est le signe que « Surveillance des
+        entrées » n'est pas autorisée → on le diagnostique et on propose de l'ouvrir."""
+        self._captured = None
+        self._capturing = True
+        try:
+            validated = rumps.alert(
+                title="Choisir la touche de dictée",
+                message="Appuie MAINTENANT sur la touche que tu veux utiliser pour la "
+                        "dictée éclair (idéalement une touche de fonction comme F6, ou un "
+                        "modificateur comme Option), puis clique « Valider » à la souris.\n\n"
+                        "Astuce : évite une lettre normale — tu l'écrirais en dictant.",
+                ok="Valider", cancel="Annuler",
+            )
+        except Exception as e:
+            log(f"capture touche : {e}")
+            self._capturing = False
+            return
+        self._capturing = False
+        key = self._captured
+        self._captured = None
+
+        if not validated:                 # Annuler
+            return
+        if key is None:
+            # Aucune touche reçue : très probablement « Surveillance des entrées » non
+            # accordée (l'écoute clavier ne reçoit alors RIEN). On guide l'utilisateur.
+            if self._confirm(
+                    "Aucune touche détectée.\n\nSoit tu n'as pas appuyé, soit "
+                    "l'autorisation « Surveillance des entrées » manque pour VoixFlash "
+                    "(il apparaît sous le nom « Python »).\n\nOuvrir ce réglage maintenant ?",
+                    ok="Ouvrir le réglage", cancel="Plus tard"):
+                self.open_input_settings(None)
+            return
+
+        serialized = serialize_hotkey(key)
+        if not serialized:
+            self._show_error("Touche non reconnue, réessaie avec une autre touche.")
+            return
+        label = hotkey_display(key)
+        self.config["hotkey"] = serialized
+        self.config["hotkey_label"] = label
+        save_json(CONFIG_PATH, self.config)
+        self._hotkey = parse_hotkey(serialized)
+        self._ptt_active = False
+        self._refresh_hotkey_menu()
+
+        # Avertissement doux si la touche produit aussi un caractère (risque de l'écrire).
+        note = ""
+        if not isinstance(key, keyboard.Key) and getattr(key, "char", None):
+            note = ("\n\n⚠ Cette touche écrit aussi un caractère : tu risques de l'insérer "
+                    "en dictant. Une touche de fonction (F6…) serait plus sûre.")
+        self._show_info("Touche réglée", f"Dictée éclair : {label} ✓{note}")
 
     def _make_history_cb(self, entry_id):
         """Clic sur une entrée d'historique → ouvre sa fenêtre de transcription."""
@@ -689,9 +884,13 @@ class VoixFlashApp(rumps.App):
         save_json(CONFIG_PATH, self.config)
 
     # --------------------------------------------------------- modèle Whisper --
-    def _load_model(self):
-        """Charge (ou recharge) le moteur de transcription, en arrière-plan."""
-        name = self.config["model"]
+    def _load_model(self, name=None, announce=False):
+        """Charge (ou recharge) le moteur de transcription, en arrière-plan.
+        name : modèle à charger (par défaut celui de la config, pour le démarrage).
+        announce=True : informe l'utilisateur quand le modèle est prêt (changement
+        demandé via le menu) ; au démarrage on reste silencieux."""
+        if name is None:
+            name = self.config["model"]
         self._ui_queue.put(("state", "loading"))
         try:
             # device="cpu" et compute_type="int8" : impératif sur Apple Silicon
@@ -713,14 +912,28 @@ class VoixFlashApp(rumps.App):
                 log(f"Modèle « {name} » absent du cache ({cache_miss}) — téléchargement…")
                 model = WhisperModel(name, device="cpu", compute_type="int8")
                 log(f"Modèle téléchargé puis chargé : {name}")
+            # On ne « commit » le modèle QUE s'il est toujours celui demandé : si
+            # l'utilisateur a recliqué sur une autre qualité entre-temps, ce chargement
+            # est obsolète → on l'abandonne (pas d'écrasement, pas d'alerte « prêt »).
+            committed = False
             with self._lock:
-                self.model = model
-                self.model_name_loaded = name
+                if name == self._requested_model:
+                    self.model = model
+                    self.model_name_loaded = name
+                    committed = True
+            if committed and announce:
+                self._ui_queue.put(("info", ("Modèle prêt",
+                                             f"« {self._model_label(name)} » est chargé. ✓")))
+            elif not committed:
+                log(f"Chargement de « {name} » abandonné : « {self._requested_model} » demandé entre-temps.")
         except Exception as e:
             log(f"Erreur de chargement du modèle '{name}' : {e}")
             self._ui_queue.put(("error", f"Impossible de charger le modèle « {name} » : {e}"))
         finally:
-            if not self._recording:
+            # On ne remet « prêt » (icône pleine) que pour le chargement courant : un
+            # chargement obsolète ne doit pas faire croire que tout est prêt alors que
+            # le bon modèle se charge encore.
+            if not self._recording and name == self._requested_model:
                 self._ui_queue.put(("state", "idle"))
 
     # --------------------------------------------------------- écoute clavier --
@@ -741,6 +954,11 @@ class VoixFlashApp(rumps.App):
         # IMPORTANT : aucune exception ne doit sortir d'un callback pynput, sinon
         # l'écoute clavier meurt et la dictée ne marche plus du tout.
         try:
+            # Mode capture : on mémorise la touche pressée (la dernière gagne) et on
+            # ne déclenche surtout pas d'enregistrement.
+            if self._capturing:
+                self._captured = key
+                return
             # On ignore la répétition automatique tant que la touche reste maintenue.
             if self._ptt_active:
                 return
@@ -759,6 +977,8 @@ class VoixFlashApp(rumps.App):
 
     def _on_release(self, key):
         try:
+            if self._capturing:
+                return
             if not self._ptt_active:
                 return
             if not key_matches(key, self._hotkey):
@@ -890,13 +1110,17 @@ class VoixFlashApp(rumps.App):
                 self._ui_queue.put(("state", "idle"))
                 return
 
+            # Langue : "fr"/"en" forcée, ou "auto" → on passe None à Whisper, qui
+            # détecte alors la langue de la dictée (idéal pour alterner FR/EN).
+            lang = self.config.get("language", "fr")
+            whisper_lang = None if lang == "auto" else lang
             # vad_filter (détection de voix) seulement pour les réunions : il évite
             # de transcrire les longs silences. En dictée éclair on parle exprès,
             # donc on le désactive pour ne jamais perdre un mot.
             # condition_on_previous_text=False : évite les répétitions en boucle.
             segments, info = model.transcribe(
                 audio,
-                language=self.config["language"],
+                language=whisper_lang,
                 beam_size=int(self.config.get("beam_size", 5)),
                 vad_filter=(mode == "meeting"),
                 condition_on_previous_text=False,
@@ -1029,6 +1253,9 @@ class VoixFlashApp(rumps.App):
                     self.meeting_item.title = payload
                 elif kind == "error":
                     self._present(self._show_error, payload)
+                elif kind == "info":
+                    title, msg = payload
+                    self._present(self._show_info, title, msg)
                 elif kind == "welcome":
                     self._present(self._show_welcome)
         except Exception as e:
@@ -1180,7 +1407,6 @@ class VoixFlashApp(rumps.App):
         except Exception as e:
             log(f"export historique : {e}")
             self._show_info("VoixFlash", f"Échec de l'export : {e}")
-            self._show_info("VoixFlash", f"Échec de l'export : {e}")
 
     def clear_history(self, _sender):
         """Vide tout l'historique (après confirmation)."""
@@ -1249,16 +1475,17 @@ class VoixFlashApp(rumps.App):
         """Mode d'emploi complet : rassemble toutes les règles utiles (y compris les
         comportements implicites), dans une fenêtre déroulante. Le texte s'adapte aux
         réglages actuels (touche, presse-papiers, modèle, langue, horodatage)."""
-        hk = self._hotkey_label(self.config.get("hotkey", "alt_r"))
+        hk = self._current_hotkey_label()
         restore_on = bool(self.config.get("restore_clipboard", True))
         restore_state = "activé" if restore_on else "désactivé"
         model_labels = {val: label for label, val in MODEL_CHOICES}
         model = model_labels.get(self.config.get("model", "small"), self.config.get("model", "small"))
-        lang = "Français" if self.config.get("language", "fr") == "fr" else "Anglais"
+        lang = {"fr": "Français", "en": "Anglais", "auto": "Automatique"}.get(
+            self.config.get("language", "fr"), "Français")
         ts_state = "activé" if self.config.get("meeting_timestamps") else "désactivé"
 
         guide = (
-            "VOIXFLASH — MODE D'EMPLOI COMPLET\n"
+            f"VOIXFLASH {APP_VERSION} — MODE D'EMPLOI COMPLET\n"
             "\n"
             "━━━ 1. LES DEUX FAÇONS DE DICTER ━━━\n"
             "\n"
@@ -1319,6 +1546,12 @@ class VoixFlashApp(rumps.App):
             "Sur un MacBook, l'icône peut se cacher derrière l'encoche de la caméra :\n"
             "réduis le nombre d'icônes voisines si tu ne la vois pas.\n"
             "\n"
+            "Quand tu CHANGES de qualité, l'icône revient au micro « fin » (chargement)\n"
+            "le temps de préparer le nouveau modèle. La TOUTE PREMIÈRE fois qu'on choisit\n"
+            "une qualité, le modèle est TÉLÉCHARGÉ (jusqu'à ~1 min ; le « medium » fait\n"
+            "~1,5 Go) — un message le signale. Ensuite c'est en cache et bien plus rapide.\n"
+            "Un message « Modèle prêt ✓ » confirme quand tu peux dicter.\n"
+            "\n"
             "━━━ 5. L'HISTORIQUE ━━━\n"
             "\n"
             "• Toutes les transcriptions (éclair ET réunions) s'ajoutent à\n"
@@ -1334,10 +1567,20 @@ class VoixFlashApp(rumps.App):
             "━━━ 6. LES RÉGLAGES ━━━\n"
             "\n"
             f"• Qualité / vitesse : Rapide (tiny) → Très précis (medium). Actuel : {model}.\n"
-            "  Passer à un modèle pas encore téléchargé demande internet UNE fois.\n"
-            f"• Langue : Français / Anglais. Actuel : {lang}.\n"
-            f"• Touche de dictée : Option droite (défaut), Cmd droite, Ctrl droite, F5.\n"
-            f"  Actuel : {hk}. Le changement est immédiat (pas besoin de redémarrer).\n"
+            "  1er choix d'une qualité = téléchargement unique (voir section 4). Astuce :\n"
+            "  pour une dictée courte et claire en français, « tiny » est souvent déjà\n"
+            "  excellent ET très rapide ; les gros modèles aident surtout sur le bruit,\n"
+            "  les accents, le vocabulaire rare et les mots anglais.\n"
+            f"• Langue : Français / Anglais / Automatique. Actuel : {lang}.\n"
+            "   – « Automatique » détecte la langue à chaque dictée : idéal pour ALTERNER\n"
+            "     français et anglais. En réunion c'est très fiable ; pour une dictée\n"
+            "     éclair très courte (1-2 mots), la détection a peu de matière et peut se\n"
+            "     tromper — dans ce cas, fixe Français ou Anglais.\n"
+            "   – MÉLANGER les deux langues DANS la même phrase n'est pas bien géré par le\n"
+            "     moteur (il choisit une langue dominante) ; un modèle plus gros aide un peu.\n"
+            f"• Touche de dictée : préréglages (Option droite, Cmd droite, Ctrl droite,\n"
+            f"  F5) OU « Choisir ma touche… » qui capte la touche que TU presses (le plus\n"
+            f"  fiable, quel que soit le clavier). Actuel : {hk}. Effet immédiat.\n"
             f"• Réunions › Horodatage des passages : ajoute [mm:ss]. Actuel : {ts_state}.\n"
             "\n"
             "━━━ 7. AUTORISATIONS (à faire une seule fois) ━━━\n"
@@ -1409,7 +1652,7 @@ class VoixFlashApp(rumps.App):
                     "2) Accessibilité — pour coller le texte (Cmd+V)\n"
                     "3) Surveillance des entrées — pour la touche de dictée\n\n"
                     "Ensuite, clique « Redémarrer VoixFlash ».\n\n"
-                    f"Dictée éclair : maintiens la touche « {self._hotkey_label(self.config['hotkey'])} », parle, relâche.",
+                    f"Dictée éclair : maintiens la touche « {self._current_hotkey_label()} », parle, relâche.",
             ok="J'ai compris",
         )
 
