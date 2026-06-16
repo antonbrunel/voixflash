@@ -1,0 +1,27 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- macOS ---
+.DS_Store
+.AppleDouble
+Icon?
+
+# --- Données créées à l'exécution (ne JAMAIS versionner : privées) ---
+voixflash.log
+history.db
+history.json
+history.json.bak
+config.json
+*.tmp
+
+# --- Outils / divers ---
+.firecrawl/
+
+# --- Artefacts de distribution (générés par build-release.command) ---
+/dist/
+/build/
+VoixFlash*.zip
