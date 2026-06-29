@@ -35,6 +35,14 @@ import rumps
 from pynput import keyboard
 from faster_whisper import WhisperModel
 
+# PyAV est livré avec faster-whisper : il décode quasiment tout format audio/vidéo
+# (mp3, m4a, wav, flac, ogg, aiff, et la piste audio des mp4/mov) SANS ffmpeg système.
+# Sert à l'import d'un fichier audio (lecture de durée + décodage en flux vers 16 kHz mono).
+try:
+    import av
+except Exception:  # si PyAV manquait, l'import de fichier sera simplement indisponible
+    av = None
+
 # Cacher l'icône du Dock : VoixFlash est une application "accessoire", visible
 # uniquement dans la barre des menus en haut de l'écran.
 try:
@@ -42,6 +50,14 @@ try:
 except Exception:  # au cas où AppKit ne serait pas disponible
     NSApplication = None
     NSApplicationActivationPolicyAccessory = None
+
+# Sélecteur de fichier natif macOS (pour « Importer un fichier audio… »). Importé à
+# part : si AppKit/NSOpenPanel manquait, l'import de fichier se rabat sur un message.
+try:
+    from AppKit import NSOpenPanel, NSModalResponseOK
+except Exception:
+    NSOpenPanel = None
+    NSModalResponseOK = None
 
 # Pour afficher une fenêtre modale au tour de boucle suivant, sans bloquer la
 # boucle de rafraîchissement de l'interface.
@@ -79,6 +95,24 @@ CLIP_ENV = {**os.environ, "LANG": "en_US.UTF-8", "LC_CTYPE": "en_US.UTF-8"}
 MAX_MEETING_SECONDS = 3 * 60 * 60   # arrêt auto d'une réunion après 3 h
 MAX_FLASH_SECONDS = 120             # dictée éclair maintenue anormalement longtemps
 
+# --- Import d'un fichier audio (menu Réunions › « Importer un fichier audio… ») -------
+# On ne décode JAMAIS le fichier entier en mémoire : on le lit en flux et on le transcrit
+# par BLOCS. Un fichier de 2 h ferait sinon ~460 Mo de float32 16 kHz en RAM, en plus du
+# modèle. Le découpage borne la mémoire (~un bloc à la fois), permet d'afficher une
+# progression, de sauvegarder au fil de l'eau, et d'annuler proprement.
+IMPORT_CHUNK_SECONDS = 8 * 60       # durée cible d'un bloc de transcription (~30 Mo en RAM)
+IMPORT_CUT_SEARCH_SEC = 20         # fenêtre (s) où chercher un silence pour couper le bloc
+IMPORT_WARN_SECONDS = 30 * 60      # au-delà : on prévient + estimation de temps avant de lancer
+IMPORT_MAX_SECONDS = MAX_MEETING_SECONDS   # 3 h : confirmation forte au-delà (RAM/temps)
+IMPORT_CHUNK_PAUSE = 0.25          # courte pause entre blocs : laisse respirer le CPU/thermique
+# Facteur « temps de calcul ≈ durée audio × facteur » selon le modèle, sur CPU int8 Apple
+# Silicon. Sert UNIQUEMENT à donner une estimation indicative avant un long import.
+IMPORT_RT_FACTOR = {"tiny": 0.06, "base": 0.1, "small": 0.25,
+                    "medium": 0.6, "large-v3": 1.2, "large-v2": 1.2}
+# Nombre de threads CPU laissés au moteur : on garde 2 cœurs libres pour que la machine
+# reste utilisable pendant une transcription longue (réunions ET imports en profitent).
+CPU_THREADS = max(1, (os.cpu_count() or 4) - 2)
+
 os.makedirs(APP_HOME, exist_ok=True)
 os.makedirs(TRANSCRIPTS_DIR, exist_ok=True)
 
@@ -109,6 +143,11 @@ STATE_SYMBOLS = {
 # Libellés du menu réunion (sans emoji : ils dénotaient dans un menu macOS natif).
 MEETING_START_TITLE = "Démarrer une réunion"
 MEETING_STOP_TITLE = "Arrêter la réunion"
+
+# Libellés de l'item « Importer un fichier audio » (qui bascule en « Annuler » pendant
+# qu'un import est en cours de transcription).
+IMPORT_IDLE_TITLE = "Importer un fichier audio…"
+IMPORT_CANCEL_TITLE = "Annuler la transcription en cours"
 
 # Repli (anciens macOS sans symboles SF) : on garde de simples emojis comme titre.
 STATE_TITLES = {
@@ -172,6 +211,17 @@ def fmt_ts(seconds):
     """Met en forme un horodatage en mm:ss."""
     seconds = int(seconds or 0)
     return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+
+def fmt_duration(seconds):
+    """Durée lisible pour un humain : « 45 s », « 12 min » ou « 1 h 23 »."""
+    seconds = int(seconds or 0)
+    if seconds < 60:
+        return f"{seconds} s"
+    if seconds < 3600:
+        return f"{seconds // 60} min"
+    h, m = divmod(seconds // 60, 60)
+    return f"{h} h {m:02d}"
 
 
 def parse_hotkey(s):
@@ -301,6 +351,110 @@ def model_is_cached(name):
         return False
     except Exception:
         return False
+
+
+def audio_stream_info(path):
+    """Renvoie (durée_en_secondes | None, a_une_piste_audio: bool) pour un fichier média.
+
+    Lecture des MÉTADONNÉES uniquement (aucun décodage) : c'est instantané, ce qui permet
+    de prévenir l'utilisateur AVANT de lancer un long décodage. Renvoie (None, False) si le
+    fichier est illisible, protégé (DRM), ou n'est pas un média — l'appelant affiche alors
+    un message clair plutôt que de planter."""
+    if av is None:
+        return (None, False)
+    try:
+        with av.open(path) as container:
+            audio_streams = [s for s in container.streams if s.type == "audio"]
+            if not audio_streams:
+                return (None, False)               # aucune piste audio dans le fichier
+            dur = None
+            if container.duration:                 # micro-secondes (av.time_base = 1e6)
+                dur = float(container.duration) / av.time_base
+            else:                                  # repli : durée portée par le flux audio
+                st = audio_streams[0]
+                if st.duration and st.time_base:
+                    dur = float(st.duration * st.time_base)
+            return (dur, True)
+    except Exception as e:
+        log(f"audio_stream_info({os.path.basename(path)}) : {e}")
+        return (None, False)
+
+
+def iter_audio_chunks(path, cancel_check=None):
+    """Décode un fichier média EN FLUX et le restitue par BLOCS float32 16 kHz mono.
+
+    Générateur de tuples (audio_float32, start_sec), où start_sec est l'horodatage (en
+    secondes) du début du bloc dans le fichier d'origine — indispensable pour réaligner
+    l'horodatage des passages sur toute la durée.
+
+    Choix de conception (tous au service d'un import long et propre) :
+    • Mémoire bornée : on n'accumule qu'un bloc (~IMPORT_CHUNK_SECONDS) à la fois, jamais le
+      fichier entier. Un fichier de 5 h se transcrit avec la même empreinte mémoire qu'un de 5 min.
+    • Coupe dans le SILENCE : quand le tampon dépasse la taille cible, on cherche la fenêtre
+      de 0,5 s la moins énergique (RMS mini) autour de la frontière et on coupe LÀ — jamais
+      au milieu d'un mot. Aucun chevauchement ni dédoublonnage n'est donc nécessaire.
+    • Rééchantillonnage systématique vers 16 kHz mono (quel que soit le format/canaux source).
+    • Annulable : si cancel_check() devient vrai, on s'arrête après le bloc en cours."""
+    if av is None:
+        raise RuntimeError("PyAV indisponible : impossible de décoder le fichier.")
+    SR = 16000
+    target = int(IMPORT_CHUNK_SECONDS * SR)
+    search = int(IMPORT_CUT_SEARCH_SEC * SR)
+    win = int(0.5 * SR)                 # fenêtre d'analyse d'énergie : 0,5 s
+    resampler = av.AudioResampler(format="flt", layout="mono", rate=SR)
+    parts = []                          # morceaux float32 en attente d'émission
+    pending = 0                         # total d'échantillons dans `parts`
+    emitted = 0                         # échantillons déjà émis (→ start_sec du bloc suivant)
+
+    def _push(arr):
+        nonlocal pending
+        if arr.size:
+            parts.append(arr)
+            pending += arr.size
+
+    def _best_cut(b):
+        # Indice de coupe au creux d'énergie dans [target-search, target+search], borné.
+        lo = max(win, target - search)
+        hi = min(len(b) - win, target + search)
+        if hi <= lo:
+            return min(target, len(b))
+        best_i, best_e = lo, None
+        step = max(1, win // 2)
+        for i in range(lo, hi, step):
+            e = float(np.mean(b[i:i + win] ** 2))
+            if best_e is None or e < best_e:
+                best_e, best_i = e, i
+        return best_i
+
+    cancelled = False
+    with av.open(path) as container:
+        astream = next((s for s in container.streams if s.type == "audio"), None)
+        if astream is None:
+            raise RuntimeError("Le fichier ne contient pas de piste audio.")
+        for frame in container.decode(astream):
+            if cancel_check and cancel_check():
+                cancelled = True
+                break
+            for r in resampler.resample(frame):
+                _push(r.to_ndarray().reshape(-1).astype(np.float32))
+            while pending >= target + search:
+                b = np.concatenate(parts)
+                cut = _best_cut(b)
+                yield b[:cut], emitted / SR
+                emitted += cut
+                rem = b[cut:]
+                parts = [rem]
+                pending = rem.size
+        # Vider le rééchantillonneur (frames en attente) puis émettre le reliquat final —
+        # sauf si l'utilisateur a annulé (on garde alors uniquement ce qui a déjà été émis).
+        if not cancelled:
+            try:
+                for r in resampler.resample(None):
+                    _push(r.to_ndarray().reshape(-1).astype(np.float32))
+            except Exception:
+                pass
+            if pending > 0:
+                yield np.concatenate(parts), emitted / SR
 
 
 def accessibility_trusted():
@@ -513,6 +667,12 @@ class VoixFlashApp(rumps.App):
         self._requested_model = self.config["model"]  # dernier modèle DEMANDÉ (le plus récent gagne)
         self._state = "loading"
         self._recording = False
+        # Une transcription est-elle EN COURS (réunion/dictée OU import de fichier) ? Le
+        # moteur CTranslate2 n'est pas réentrant : deux transcriptions simultanées le feraient
+        # planter. Ce drapeau unifié interdit tout chevauchement (cf. _process_audio, _run_import).
+        self._transcribing = False
+        self._importing = False           # un import de FICHIER est-il en cours ? (≠ réunion)
+        self._import_cancel = False       # demande d'annulation de l'import en cours
         self._record_mode = None          # "flash" ou "meeting"
         self._ptt_active = False          # touche de dictée actuellement maintenue ?
         self._capturing = False           # en train de capturer une nouvelle touche ?
@@ -592,6 +752,11 @@ class VoixFlashApp(rumps.App):
         ]
 
         # Sous-menu « Réunions » : actions et réglages propres aux réunions.
+        # « Importer un fichier audio… » : transcrit un fichier existant (ou la piste audio
+        # d'une vidéo) exactement comme une réunion. L'item bascule en « Annuler… » pendant
+        # le traitement (cf. import_audio_file / _run_import).
+        self.import_item = rumps.MenuItem(IMPORT_IDLE_TITLE, callback=self.import_audio_file)
+        self.reunions_menu.add(self.import_item)
         self.reunions_menu.add(rumps.MenuItem("Exporter la dernière réunion (.txt)",
                                               callback=self.export_last_meeting))
         self.reunions_menu.add(self.ts_item)
@@ -902,15 +1067,19 @@ class VoixFlashApp(rumps.App):
             # SYN_SENT, ou requêtes anonymes étranglées), ce contrôle PEND indéfiniment
             # et l'app reste coincée sur « chargement ». Or l'app est hors-ligne par
             # conception : on charge donc d'abord depuis le cache, SANS aucun réseau.
+            # cpu_threads bridé (CPU_THREADS = cœurs - 2) : la transcription ne monopolise
+            # plus tous les cœurs, donc la machine reste utilisable pendant un long traitement
+            # (réunions ET imports de fichiers en profitent).
             try:
                 model = WhisperModel(name, device="cpu", compute_type="int8",
-                                     local_files_only=True)
+                                     cpu_threads=CPU_THREADS, local_files_only=True)
                 log(f"Modèle chargé depuis le cache : {name}")
             except Exception as cache_miss:
                 # Modèle pas encore téléchargé (tout premier usage de cette qualité) :
                 # on autorise alors le téléchargement réseau, une seule fois.
                 log(f"Modèle « {name} » absent du cache ({cache_miss}) — téléchargement…")
-                model = WhisperModel(name, device="cpu", compute_type="int8")
+                model = WhisperModel(name, device="cpu", compute_type="int8",
+                                     cpu_threads=CPU_THREADS)
                 log(f"Modèle téléchargé puis chargé : {name}")
             # On ne « commit » le modèle QUE s'il est toujours celui demandé : si
             # l'utilisateur a recliqué sur une autre qualité entre-temps, ce chargement
@@ -965,6 +1134,9 @@ class VoixFlashApp(rumps.App):
             if not key_matches(key, self._hotkey):
                 return
             if self._recording:               # une réunion est déjà en cours
+                return
+            if self._transcribing:            # un import/une transcription tourne déjà
+                self._ui_queue.put(("error", "Une transcription est déjà en cours, réessaie dans un instant."))
                 return
             if self.model is None:            # le moteur n'est pas encore prêt
                 self._ui_queue.put(("error", "Le moteur de transcription se charge encore, réessaie dans un instant."))
@@ -1057,6 +1229,10 @@ class VoixFlashApp(rumps.App):
             if not self._recording:
                 return
             self._recording = False
+            # On entre en phase de transcription : le drapeau interdit qu'un import de
+            # fichier (ou une autre transcription) démarre en parallèle. _process_audio le
+            # remettra à False dans son `finally`.
+            self._transcribing = True
             mode = self._record_mode
             self._record_mode = None
             self._record_start = None
@@ -1172,6 +1348,12 @@ class VoixFlashApp(rumps.App):
             log(f"Erreur de transcription : {e}")
             self._ui_queue.put(("error", f"Erreur de transcription : {e}"))
             self._ui_queue.put(("state", "idle"))
+        finally:
+            # Fin de la phase de transcription, quel que soit le chemin (succès, audio
+            # vide, hallucination, erreur) : on libère le drapeau pour autoriser la
+            # prochaine dictée/réunion/import.
+            with self._lock:
+                self._transcribing = False
 
     # ------------------------------------------------- presse-papiers & collage --
     @staticmethod
@@ -1251,6 +1433,13 @@ class VoixFlashApp(rumps.App):
                 elif kind == "meeting_title":
                     # Demande du thread de garde-fous : remettre le titre du menu réunion.
                     self.meeting_item.title = payload
+                elif kind == "import_title":
+                    # Bascule du libellé de l'item d'import (Importer ↔ Annuler ↔ repos).
+                    self.import_item.title = payload
+                elif kind == "import_progress":
+                    # Progression d'un import affichée dans le titre du menu (non modal). On
+                    # GARDE le mot « Annuler » : l'item reste cliquable pour interrompre.
+                    self.import_item.title = f"Annuler la transcription… ({payload} %)"
                 elif kind == "error":
                     self._present(self._show_error, payload)
                 elif kind == "info":
@@ -1347,6 +1536,11 @@ class VoixFlashApp(rumps.App):
         if recording and mode == "flash":
             return  # une dictée éclair est en cours, on ne touche à rien
         if not recording:
+            if self._transcribing:
+                # Un import de fichier (ou la fin d'une réunion) est en cours de
+                # transcription : on ne lance pas un enregistrement par-dessus.
+                self._present(self._show_error, "Une transcription est déjà en cours, réessaie dans un instant.")
+                return
             if self.model is None:
                 self._present(self._show_error, "Le moteur de transcription se charge encore, réessaie dans un instant.")
                 return
@@ -1356,6 +1550,244 @@ class VoixFlashApp(rumps.App):
         else:
             sender.title = MEETING_START_TITLE
             self._stop_recording()
+
+    # ------------------------------------------------ import d'un fichier audio --
+    def _pick_audio_file(self):
+        """Ouvre le sélecteur de fichier natif macOS et renvoie le chemin choisi (ou None
+        si annulé / indisponible). Appelé depuis un callback de menu, donc sur le thread
+        principal — `runModal()` y est légitime (comme rumps.alert)."""
+        if NSOpenPanel is None:
+            self._show_error("Sélecteur de fichier indisponible sur ce système.")
+            return None
+        try:
+            panel = NSOpenPanel.openPanel()
+            panel.setCanChooseFiles_(True)
+            panel.setCanChooseDirectories_(False)
+            panel.setAllowsMultipleSelection_(False)
+            panel.setResolvesAliases_(True)
+            panel.setTitle_("Choisir un fichier audio ou vidéo à transcrire")
+            # Types acceptés (PyAV décode l'audio de tous) : on s'appuie sur les extensions
+            # plutôt que sur des UTType (compatibles toutes versions de macOS).
+            panel.setAllowedFileTypes_([
+                "mp3", "m4a", "aac", "wav", "aif", "aiff", "caf", "flac",
+                "ogg", "oga", "opus", "wma", "amr",
+                "mp4", "m4v", "mov", "avi", "mkv", "webm",  # vidéos : on prend la piste audio
+            ])
+            ok = (NSModalResponseOK if NSModalResponseOK is not None else 1)
+            if panel.runModal() != ok:
+                return None
+            urls = panel.URLs()
+            if not urls or urls.count() == 0:
+                return None
+            # .path() renvoie une NSString (sous-classe de str) : on la fige en str Python
+            # pur pour qu'elle traverse av.open / os.path sans surprise.
+            return str(urls.objectAtIndex_(0).path())
+        except Exception as e:
+            log(f"_pick_audio_file : {e}")
+            self._show_error(f"Impossible d'ouvrir le sélecteur de fichier : {e}")
+            return None
+
+    def import_audio_file(self, sender):
+        """Callback du menu « Importer un fichier audio… ».
+
+        Deux comportements selon l'état :
+        • PENDANT un import (l'item s'intitule « Annuler… ») : on demande l'annulation.
+        • AU REPOS : on vérifie les garde-fous (moteur prêt, rien d'autre en cours), on
+          fait choisir un fichier, on lit sa durée pour prévenir si c'est long, puis on
+          lance la transcription par blocs dans un thread de fond (_run_import)."""
+        # --- cas « annulation » : un import de FICHIER est déjà en cours ---
+        with self._lock:
+            importing = self._importing
+            if importing:
+                # On pose le drapeau SOUS LE VERROU (cohérence avec les autres drapeaux) ;
+                # _run_import s'arrête au prochain bloc en gardant le texte déjà transcrit.
+                # (Une transcription de réunion, elle, n'amène pas ce bouton.)
+                self._import_cancel = True
+        if importing:
+            self._ui_queue.put(("import_title", "Annulation en cours…"))
+            return
+
+        # --- cas « lancer un import » ---
+        if av is None:
+            self._show_error("Le décodage audio (PyAV) est indisponible : impossible "
+                             "d'importer un fichier sur cette installation.")
+            return
+        if self.model is None:
+            self._show_error("Le moteur de transcription se charge encore, réessaie dans un instant.")
+            return
+        with self._lock:
+            if self._recording or self._transcribing:
+                self._show_error("Une transcription est déjà en cours, réessaie dans un instant.")
+                return
+
+        path = self._pick_audio_file()
+        if not path:
+            return
+
+        dur, has_audio = audio_stream_info(path)
+        if not has_audio:
+            self._show_error("Ce fichier ne contient pas de piste audio lisible "
+                             "(format non pris en charge, fichier protégé ou corrompu).")
+            return
+
+        # Avertissement / confirmation selon la durée (lue sans décoder).
+        if dur is not None:
+            if dur > IMPORT_MAX_SECONDS:
+                if not self._confirm(
+                    f"Ce fichier dure {fmt_duration(dur)} — c'est très long.\n"
+                    "La transcription peut prendre beaucoup de temps et de mémoire. "
+                    "Tu peux l'annuler à tout moment depuis le menu.\nLancer quand même ?",
+                    ok="Lancer", cancel="Annuler"):
+                    return
+            elif dur > IMPORT_WARN_SECONDS:
+                est = self._estimate_import_minutes(dur)
+                if not self._confirm(
+                    f"Ce fichier dure {fmt_duration(dur)}.\n"
+                    f"Transcription estimée à ~{est} (selon la qualité choisie). "
+                    "Elle tourne en arrière-plan ; tu peux l'annuler depuis le menu.\n"
+                    "Lancer ?", ok="Lancer", cancel="Annuler"):
+                    return
+
+        # Réservation de l'état et lancement du thread de fond.
+        with self._lock:
+            if self._recording or self._transcribing:
+                self._show_error("Une transcription est déjà en cours, réessaie dans un instant.")
+                return
+            self._transcribing = True
+            self._importing = True
+            self._import_cancel = False
+        self._ui_queue.put(("state", "transcribing"))
+        self._ui_queue.put(("import_title", IMPORT_CANCEL_TITLE))
+        threading.Thread(target=self._run_import, args=(path, dur), daemon=True).start()
+
+    def _estimate_import_minutes(self, duration_seconds):
+        """Estimation lisible du temps de transcription (≈ durée × facteur du modèle)."""
+        factor = IMPORT_RT_FACTOR.get(self.config.get("model", "small"), 0.25)
+        secs = max(1, int(duration_seconds * factor))
+        if secs < 90:
+            return f"{secs} s"
+        return f"{round(secs / 60)} min"
+
+    def _run_import(self, path, total_dur):
+        """Transcrit un fichier audio EN BLOCS, dans un thread de fond. Réutilise la même
+        logique de rendu qu'une réunion (horodatage, anti-hallucination, historique, fenêtre
+        de résultat), mais en streaming pour borner la mémoire et permettre progression +
+        annulation + sauvegarde partielle. La langue est détectée sur le 1er bloc puis FIGÉE
+        pour tous les suivants (cohérence sur tout le fichier)."""
+        stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        partial_path = os.path.join(TRANSCRIPTS_DIR, f"import_partiel_{stamp}.txt")
+        pieces = []                         # textes des blocs déjà transcrits
+        forced_lang = None                  # langue figée après le 1er bloc
+        timestamps = bool(self.config.get("meeting_timestamps"))
+        beam = int(self.config.get("beam_size", 5))
+        sep = "\n" if timestamps else " "   # défini AVANT la boucle : réutilisé même en cas
+        cancelled = False                   # d'exception (sauvetage des blocs déjà faits)
+        try:
+            with self._lock:
+                model = self.model
+            if model is None:
+                self._ui_queue.put(("error", "Moteur de transcription indisponible."))
+                return
+
+            for audio, start_sec in iter_audio_chunks(path, cancel_check=lambda: self._import_cancel):
+                if self._import_cancel:
+                    cancelled = True
+                    break
+                if len(audio) < 1600:       # bloc < 0,1 s : rien d'exploitable
+                    continue
+                # 1er bloc en détection auto ; on mémorise la langue et on la force ensuite.
+                segments, info = model.transcribe(
+                    audio,
+                    language=forced_lang,   # None au 1er bloc → auto
+                    beam_size=beam,
+                    vad_filter=True,
+                    condition_on_previous_text=False,
+                )
+                seglist = list(segments)
+                if forced_lang is None and getattr(info, "language", None):
+                    forced_lang = info.language
+
+                if timestamps:
+                    # Horodatage réaligné sur la position du bloc dans le fichier complet.
+                    block = "\n".join(
+                        f"[{fmt_ts(s.start + start_sec)}] {s.text.strip()}"
+                        for s in seglist).strip()
+                else:
+                    block = " ".join(s.text.strip() for s in seglist).strip()
+
+                if is_probably_hallucination(block):
+                    block = ""              # bloc parasite (silence) : ignoré, pas tout le texte
+                if block:
+                    pieces.append(block)
+                    # Sauvegarde partielle : protège le travail déjà fait en cas de
+                    # fermeture/plantage pendant un import très long.
+                    try:
+                        with open(partial_path, "w", encoding="utf-8") as f:
+                            f.write(sep.join(pieces))
+                    except Exception as e:
+                        log(f"sauvegarde partielle import : {e}")
+
+                # Progression (si la durée totale est connue) + pause pour ménager le CPU.
+                if total_dur and total_dur > 0:
+                    pct = min(99, int((start_sec + len(audio) / 16000) / total_dur * 100))
+                    self._ui_queue.put(("import_progress", pct))
+                time.sleep(IMPORT_CHUNK_PAUSE)
+
+            text = sep.join(pieces).strip()
+
+            if not text:
+                if cancelled:
+                    self._ui_queue.put(("info", ("Import annulé",
+                                                 "Aucun texte n'avait encore été transcrit.")))
+                else:
+                    self._ui_queue.put(("error", "Aucun texte n'a été détecté dans ce fichier "
+                                                 "(silence, musique seule, ou parole inaudible)."))
+                return
+
+            entry = history_add("meeting", text)
+            self._ui_queue.put(("history_changed", None))
+            if cancelled:
+                self._ui_queue.put(("info", ("Import annulé",
+                                             "La partie déjà transcrite a été enregistrée "
+                                             "dans l'historique.")))
+            self._ui_queue.put(("meeting_result", entry))
+            # Le texte est maintenant en base (historique) : la sauvegarde partielle n'a plus
+            # d'utilité, qu'on soit allé au bout ou qu'on ait annulé. On ne la garde QUE si une
+            # exception nous empêche d'arriver ici (filet anti-crash, cf. bloc except).
+            try:
+                os.remove(partial_path)
+            except OSError:
+                pass
+
+        except Exception as e:
+            log(f"Erreur d'import : {e}")
+            # Sauvetage : si des blocs ont déjà été transcrits avant l'erreur (ex. fichier
+            # corrompu en cours de route), on les enregistre au lieu de les perdre.
+            salvaged = sep.join(pieces).strip()
+            if salvaged:
+                try:
+                    entry = history_add("meeting", salvaged)
+                    self._ui_queue.put(("history_changed", None))
+                    self._ui_queue.put(("meeting_result", entry))
+                    self._ui_queue.put(("error", f"Lecture interrompue ({e}). La partie déjà "
+                                                 "transcrite a été enregistrée dans l'historique."))
+                    # Le texte est sauvé en base : le fichier partiel devient redondant.
+                    try:
+                        os.remove(partial_path)
+                    except OSError:
+                        pass
+                except Exception as e2:
+                    log(f"sauvetage import : {e2}")
+                    self._ui_queue.put(("error", f"Erreur pendant l'import : {e}"))
+            else:
+                self._ui_queue.put(("error", f"Erreur pendant l'import : {e}"))
+        finally:
+            with self._lock:
+                self._transcribing = False
+                self._importing = False
+                self._import_cancel = False
+            self._ui_queue.put(("import_title", IMPORT_IDLE_TITLE))
+            self._ui_queue.put(("state", "idle"))
 
     def toggle_timestamps(self, sender):
         self.config["meeting_timestamps"] = not self.config["meeting_timestamps"]
@@ -1487,7 +1919,7 @@ class VoixFlashApp(rumps.App):
         guide = (
             f"VOIXFLASH {APP_VERSION} — MODE D'EMPLOI COMPLET\n"
             "\n"
-            "━━━ 1. LES DEUX FAÇONS DE DICTER ━━━\n"
+            "━━━ 1. LES TROIS FAÇONS DE TRANSCRIRE ━━━\n"
             "\n"
             "• DICTÉE ÉCLAIR (partout)\n"
             "  Place ton curseur dans n'importe quel champ de texte.\n"
@@ -1500,6 +1932,19 @@ class VoixFlashApp(rumps.App):
             "  Menu › « Démarrer une réunion ». Parle aussi longtemps que tu veux.\n"
             "  Menu › « Arrêter la réunion » : le texte s'affiche dans une fenêtre\n"
             "  DANS l'application — il n'est PAS collé ailleurs.\n"
+            "\n"
+            "• IMPORTER UN FICHIER AUDIO (menu › Réunions › « Importer un fichier\n"
+            "  audio… »)\n"
+            "  Choisis un fichier audio (mp3, m4a, wav, flac, ogg, aiff…) OU une vidéo\n"
+            "  (mp4, mov… : seule la piste audio est lue) : VoixFlash le transcrit\n"
+            "  comme une réunion (résultat dans une fenêtre + ajouté à l'historique).\n"
+            "  • La langue est détectée AUTOMATIQUEMENT (peu importe le réglage Langue).\n"
+            "  • Ça tourne en arrière-plan, sans bloquer le Mac ; la progression\n"
+            "    s'affiche dans le menu (« Transcription du fichier… NN % »).\n"
+            "  • Tu peux ANNULER à tout moment (le même item devient « Annuler la\n"
+            "    transcription en cours ») : le texte déjà transcrit est conservé.\n"
+            "  • Un fichier long se découpe tout seul en blocs : la mémoire reste\n"
+            "    stable même sur 2 h+ d'audio.\n"
             "\n"
             "━━━ 2. CE QUI ARRIVE À TON PRESSE-PAPIERS (à bien comprendre) ━━━\n"
             "\n"
@@ -1533,6 +1978,15 @@ class VoixFlashApp(rumps.App):
             "  sur du silence (ex. « Sous-titres réalisés par… ») : non collées.\n"
             "• Au tout premier usage après le démarrage, le premier mot peut tarder\n"
             "  d'une seconde, le temps que le moteur finisse de se charger.\n"
+            "• IMPORT D'UN FICHIER : la transcription prend du temps (tout se fait sur le\n"
+            "  processeur, sans carte graphique). Compte grossièrement, selon la qualité\n"
+            "  choisie : « small » ≈ 1 h d'audio en ~15 min ; « medium » est plus lent.\n"
+            "  Un fichier de 2 h passe sans souci (découpage automatique). Au-delà de\n"
+            "  30 min, un message annonce une estimation avant de lancer.\n"
+            "• L'import ne SÉPARE PAS les locuteurs (pas de « — Jean : … ») : c'est un\n"
+            "  texte continu. Les fichiers protégés (DRM, ex. Apple Music) sont refusés.\n"
+            "• Une seule transcription à la fois : pendant un import ou une réunion, on ne\n"
+            "  peut pas en lancer une autre (un message le rappelle).\n"
             "\n"
             "━━━ 4. L'INDICATEUR DANS LA BARRE DES MENUS ━━━\n"
             "\n"
@@ -1540,8 +1994,10 @@ class VoixFlashApp(rumps.App):
             "   • micro fin (contour) ........ le moteur se charge\n"
             "   • micro plein ................ prêt\n"
             "   • pastille d'enregistrement .. ENREGISTRE (le micro est actif !)\n"
-            "   • forme d'onde ............... transcrit\n"
+            "   • forme d'onde ............... transcrit (réunion, dictée OU import)\n"
             "   • presse-papiers ............. écrit le texte\n"
+            "Pendant un import de fichier, le menu « Réunions » affiche aussi la\n"
+            "progression (« Transcription du fichier… NN % »).\n"
             "Quand l'icône est sur « enregistre », le micro tourne : ne l'oublie pas.\n"
             "Sur un MacBook, l'icône peut se cacher derrière l'encoche de la caméra :\n"
             "réduis le nombre d'icônes voisines si tu ne la vois pas.\n"

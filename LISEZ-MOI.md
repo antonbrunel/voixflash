@@ -65,13 +65,26 @@ Le plus simple : clique sur l'icône VoixFlash dans la barre des menus ›
 > En réunion, le presse-papiers n'est **pas** touché tout seul (copie via le bouton).
 > En dictée éclair, ton presse-papiers est préservé (si du texte) puis remis en place.
 
+### Importer un fichier audio (ou vidéo)
+1. Menu › **Réunions › « Importer un fichier audio… »**, puis choisis ton fichier
+   (mp3, m4a, wav, flac, ogg, aiff… ou une vidéo mp4/mov — seule la piste audio est lue).
+2. VoixFlash le transcrit **comme une réunion** : le texte s'affiche dans une fenêtre et
+   s'ajoute à l'historique. La **langue est détectée automatiquement**.
+3. Ça tourne **en arrière-plan** : la progression s'affiche dans le menu
+   (« Transcription du fichier… NN % »). Tu peux **annuler** à tout moment (l'item devient
+   « Annuler la transcription en cours ») sans perdre le texte déjà obtenu.
+
+> Tout se fait sur le processeur : compte ~15 min pour 1 h d'audio en qualité « small »
+> (plus lent en « medium »). Les fichiers longs (**2 h et plus**) sont découpés tout seuls,
+> donc la mémoire reste stable. Pas de séparation des locuteurs ; fichiers protégés (DRM) refusés.
+
 ### Indicateur d'état (barre des menus)
 L'icône (un micro blanc) change de **forme** : micro fin = chargement · micro plein = prêt ·
 pastille d'enregistrement = enregistre · forme d'onde = transcrit · presse-papiers = écrit le texte.
 
 ### Historique
-- Toutes les transcriptions (dictées et réunions) s'ajoutent au menu **« Historique récent »**.
-  **Clique une entrée** pour la rouvrir (lire, modifier, copier, supprimer).
+- Toutes les transcriptions (dictées, réunions **et imports de fichiers**) s'ajoutent au menu
+  **« Historique récent »**. **Clique une entrée** pour la rouvrir (lire, modifier, copier, supprimer).
 - **Réunions › Exporter…** et **Exporter tout l'historique (.txt)** créent des fichiers datés.
 
 ---
@@ -83,7 +96,9 @@ pastille d'enregistrement = enregistre · forme d'onde = transcrit · presse-pap
   à chaque dictée — pratique pour alterner FR/EN).
 - **Touche de dictée** : préréglages (Option droite par défaut…) ou **« Choisir ma touche… »**
   qui capte la touche que tu presses (fiable quel que soit le clavier).
-- **Réunions › Horodatage des passages** : ajoute `[mm:ss]` devant chaque passage.
+- **Réunions › Importer un fichier audio…** : transcrit un fichier audio/vidéo existant
+  (langue auto, découpage automatique, progression, annulable).
+- **Réunions › Horodatage des passages** : ajoute `[mm:ss]` devant chaque passage (réunions et imports).
 - **Restaurer le presse-papiers après une dictée** : remet ton ancien presse-papiers (activé).
 
 > Le **1er choix** d'une qualité télécharge le modèle une fois (jusqu'à ~1 min pour

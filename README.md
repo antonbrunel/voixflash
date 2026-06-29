@@ -15,6 +15,9 @@ Aucun compte, aucun abonnement, aucune clé. Ta voix ne quitte jamais ton Mac.
   touche, parle, relâche → le texte s'écrit tout seul à l'endroit du curseur.
 - **Mode réunion** : enregistre aussi longtemps que tu veux ; le texte complet s'affiche dans
   l'app et s'exporte en `.txt` daté.
+- **Import d'un fichier audio/vidéo** : transcris un fichier existant (mp3, m4a, wav, flac,
+  ogg… ou la piste audio d'un mp4/mov). Découpage automatique, progression dans le menu,
+  annulable — tient des fichiers de **2 h et plus** sans saturer la mémoire ni le Mac.
 - **Hors-ligne et privé** : moteur [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
   sur **CPU uniquement**, rien n'est envoyé sur internet.
 - **Léger et discret** : vit dans la barre des menus, quasi invisible au repos.
@@ -84,11 +87,28 @@ Puis clique **« Redémarrer VoixFlash »**.
 
 - **Dictée éclair** : maintiens la touche (par défaut **Option droite**), parle, relâche.
 - **Réunion** : icône › **« Démarrer une réunion »** … **« Arrêter la réunion »**.
+- **Importer un fichier audio** : icône › **Réunions › « Importer un fichier audio… »** →
+  choisis un fichier audio ou vidéo. La langue est détectée automatiquement, la progression
+  s'affiche dans le menu, et l'item devient **« Annuler la transcription en cours »** si tu
+  veux l'arrêter (le texte déjà transcrit est gardé).
 - **Indicateur** (barre des menus) : micro fin = chargement · micro plein = prêt · pastille
   d'enregistrement = enregistre · forme d'onde = transcrit · presse-papiers = écrit le texte.
 
 Tout le reste (comportement du presse-papiers, limites, historique…) est détaillé dans le
 **Mode d'emploi complet** intégré à l'app.
+
+### Import audio — formats, performances et limites
+
+- **Formats** : mp3, m4a/aac, wav, aiff, caf, flac, ogg/opus… et la **piste audio des
+  vidéos** (mp4, mov, m4v, mkv, webm). Aucun ffmpeg à installer (décodage intégré).
+- **Performances** : tout se fait sur le **CPU**. Ordre de grandeur selon la qualité : *small*
+  (défaut) ≈ **1 h d'audio transcrite en ~15 min** ; *medium* nettement plus lent. L'opération
+  tourne en arrière-plan, avec le nombre de cœurs **bridé** pour garder le Mac réactif.
+- **Durée / mémoire** : les fichiers sont **découpés en blocs** et décodés en flux → la
+  mémoire reste stable même sur **2 h et plus**. Au-delà de 30 min, une estimation du temps
+  est proposée avant de lancer ; au-delà de 3 h, une confirmation est demandée.
+- **Limites** : pas de séparation des locuteurs (texte continu) ; fichiers **protégés (DRM)**
+  refusés ; une seule transcription à la fois (import, réunion ou dictée).
 
 ---
 
@@ -99,7 +119,8 @@ Tout le reste (comportement du presse-papiers, limites, historique…) est déta
 | **Qualité / vitesse** | Rapide (tiny) → Très précis (medium). Défaut : **Précis (small)**. Le **1er choix** d'une qualité télécharge le modèle une fois (jusqu'à ~1 min ; un message le signale), puis c'est hors-ligne. |
 | **Langue** | **Français** (défaut), **Anglais**, ou **Automatique** (détecte la langue à chaque dictée — idéal pour alterner FR/EN). |
 | **Touche de dictée** | Préréglages (Option droite par défaut, Cmd droite, Ctrl droite, F5) **ou « Choisir ma touche… »** : appuie sur la touche que tu veux, elle est captée telle quelle (fiable quel que soit le clavier). |
-| **Réunions › Horodatage** | Ajoute `[mm:ss]` devant chaque passage. |
+| **Réunions › Importer un fichier audio…** | Transcrit un fichier audio/vidéo existant comme une réunion (langue auto, découpage automatique, progression + annulation). |
+| **Réunions › Horodatage** | Ajoute `[mm:ss]` devant chaque passage (réunions **et** imports). |
 | **Restaurer le presse-papiers** | Remet ton ancien presse-papiers après une dictée (activé). |
 
 ---
@@ -125,6 +146,10 @@ et ses fichiers sont supprimés. Tes transcriptions `.txt` déjà exportées son
 - **Pas de son capté** → vérifie **Microphone**.
 - **Je ne vois pas l'icône** → sur un MacBook, elle peut se cacher derrière l'encoche ; réduis
   le nombre d'icônes de la barre.
+- **« Ce fichier ne contient pas de piste audio lisible »** → format non reconnu, fichier
+  corrompu ou **protégé (DRM)**. Convertis-le d'abord en mp3/m4a/wav.
+- **Import très lent** → choisis une qualité plus rapide (*small*/*base*/*tiny*) dans
+  **Qualité / vitesse** ; tu peux annuler depuis le menu sans perdre le texte déjà transcrit.
 - **Journal technique** : `~/Library/Application Support/VoixFlash/voixflash.log`
 
 ---
