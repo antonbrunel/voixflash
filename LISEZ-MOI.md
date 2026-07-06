@@ -76,7 +76,8 @@ Le plus simple : clique sur l'icône VoixFlash dans la barre des menus ›
 
 > Tout se fait sur le processeur : compte ~15 min pour 1 h d'audio en qualité « small »
 > (plus lent en « medium »). Les fichiers longs (**2 h et plus**) sont découpés tout seuls,
-> donc la mémoire reste stable. Pas de séparation des locuteurs ; fichiers protégés (DRM) refusés.
+> donc la mémoire reste stable. La séparation des locuteurs ne concerne **que les réunions
+> enregistrées en direct** (voir Réglages), pas l'import ; fichiers protégés (DRM) refusés.
 
 ### Indicateur d'état (barre des menus)
 L'icône (un micro blanc) change de **forme** : micro fin = chargement · micro plein = prêt ·
@@ -85,6 +86,9 @@ pastille d'enregistrement = enregistre · forme d'onde = transcrit · presse-pap
 ### Historique
 - Toutes les transcriptions (dictées, réunions **et imports de fichiers**) s'ajoutent au menu
   **« Historique récent »**. **Clique une entrée** pour la rouvrir (lire, modifier, copier, supprimer).
+- **Rechercher** : **Historique récent › 🔍 Rechercher…** — tape un ou plusieurs mots-clés
+  (accents et majuscules ignorés) ; les correspondances apparaissent dans **« Résultats de
+  recherche »**, cliquables.
 - **Réunions › Exporter…** et **Exporter tout l'historique (.txt)** créent des fichiers datés.
 
 ---
@@ -99,6 +103,11 @@ pastille d'enregistrement = enregistre · forme d'onde = transcrit · presse-pap
 - **Réunions › Importer un fichier audio…** : transcrit un fichier audio/vidéo existant
   (langue auto, découpage automatique, progression, annulable).
 - **Réunions › Horodatage des passages** : ajoute `[mm:ss]` devant chaque passage (réunions et imports).
+- **Réunions › Séparer les locuteurs** : affiche « — Locuteur 1 : … », « — Locuteur 2 : … »
+  dans tes réunions. La **1re activation** télécharge un petit module (~50 Mo, depuis GitHub,
+  **sans compte ni clé**) ; ensuite tout est hors-ligne. **Réunions › Locuteurs attendus** :
+  laisse **Automatique**, ou indique le nombre de personnes (plus fiable). La séparation
+  fonctionne bien sur des voix distinctes et se dégrade quand plusieurs parlent en même temps.
 - **Restaurer le presse-papiers après une dictée** : remet ton ancien presse-papiers (activé).
 
 > Le **1er choix** d'une qualité télécharge le modèle une fois (jusqu'à ~1 min pour

@@ -22,7 +22,11 @@ Aucun compte, aucun abonnement, aucune clé. Ta voix ne quitte jamais ton Mac.
   sur **CPU uniquement**, rien n'est envoyé sur internet.
 - **Léger et discret** : vit dans la barre des menus, quasi invisible au repos.
 - **Accents français impeccables** : collage via le presse-papiers (jamais lettre par lettre).
-- **Historique** local (dictées + réunions), copiable et exportable.
+- **Séparation des locuteurs** (réunions) : option à activer d'un clic — affiche « — Locuteur 1 :
+  … », « — Locuteur 2 : … ». Télécharge un petit module local une seule fois (~50 Mo, depuis
+  GitHub, **sans compte ni clé**) ; tout reste sur ton Mac.
+- **Historique** local (dictées + réunions), copiable et exportable, avec **recherche plein-texte**
+  (mots-clés, accents ignorés).
 - **Réglages simples** : qualité/vitesse, langue (FR/EN), touche de dictée.
 
 Un **mode d'emploi complet** est intégré : icône VoixFlash › **Aide & autorisations › Mode d'emploi complet**.

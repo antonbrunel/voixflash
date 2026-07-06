@@ -71,15 +71,36 @@ except Exception:
 #  Chemins & constantes
 # --------------------------------------------------------------------------- #
 APP_NAME = "VoixFlash"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 LAUNCHD_LABEL = "com.voixflash.agent"   # étiquette du LaunchAgent (cf. install.command)
 APP_HOME = os.path.expanduser(f"~/Library/Application Support/{APP_NAME}")
 CONFIG_PATH = os.path.join(APP_HOME, "config.json")
 HISTORY_PATH = os.path.join(APP_HOME, "history.json")   # ancien format (migré vers SQLite)
 HISTORY_DB = os.path.join(APP_HOME, "history.db")       # historique : base SQLite (scalable)
 HISTORY_KEEP = 1000   # nombre max d'entrées conservées (purge auto des plus anciennes)
+
+# Recherche plein-texte : disponible seulement si le SQLite embarqué gère le module
+# FTS5. Positionné par history_init(). Sinon, history_search retombe sur un balayage
+# simple (LIKE) — plus rudimentaire, mais l'historique est borné (HISTORY_KEEP).
+_FTS_AVAILABLE = False
 LOG_PATH = os.path.join(APP_HOME, "voixflash.log")
 TRANSCRIPTS_DIR = os.path.expanduser(f"~/Documents/{APP_NAME} Transcriptions")
+
+# --- Séparation des locuteurs (diarisation) — module OPTIONNEL, installé à la demande -
+# Moteur : sherpa-onnx (onnxruntime, hors-ligne). Les modèles ONNX sont hébergés sur les
+# Releases GitHub de sherpa-onnx → aucun compte ni téléchargement HuggingFace, aucune clé.
+# Volontairement PAS une dépendance de base : VoixFlash reste léger par défaut ; cette
+# couche ne s'ajoute QUE si l'utilisateur l'active depuis le menu « Réunions » (elle
+# télécharge alors sherpa-onnx + ~44 Mo de modèles, une seule fois, puis tout est local).
+DIAR_DIR = os.path.join(APP_HOME, "models", "diarization")
+DIAR_SEG_PATH = os.path.join(DIAR_DIR, "segmentation.onnx")   # pyannote 3.0 (ONNX) : ~6 Mo
+DIAR_EMB_PATH = os.path.join(DIAR_DIR, "embedding.onnx")      # empreintes locuteurs : ~38 Mo
+DIAR_SEG_URL = ("https://github.com/k2-fsa/sherpa-onnx/releases/download/"
+                "speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2")
+DIAR_EMB_URL = ("https://github.com/k2-fsa/sherpa-onnx/releases/download/"
+                "speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx")
+# Choix « nombre de locuteurs attendus » proposé dans le menu (libellé, valeur ; 0 = auto).
+DIAR_SPEAKER_CHOICES = [("Automatique", 0), ("2", 2), ("3", 3), ("4", 4), ("5", 5), ("6", 6)]
 
 # Outils macOS appelés en chemin absolu (fiabilité quand l'app est lancée par launchd).
 PBCOPY = "/usr/bin/pbcopy"
@@ -126,6 +147,8 @@ DEFAULT_CONFIG = {
     "restore_clipboard": True,    # remettre l'ancien presse-papiers après le collage
     "beam_size": 5,              # qualité du décodage (5 = bon compromis)
     "mic_primed": False,         # le micro a-t-il déjà été « amorcé » (demande d'autorisation déclenchée) ?
+    "diarization_enabled": False,  # séparer les locuteurs en réunion (« Locuteur 1 : … »)
+    "diarization_speakers": 0,   # nb de locuteurs attendus (0 = détection automatique)
 }
 
 # Icône d'état dans la barre des menus. On utilise des symboles SF (les mêmes
@@ -489,7 +512,11 @@ def _hist_db():
 
 
 def history_init():
-    """Crée la table si besoin, puis migre une seule fois l'ancien history.json."""
+    """Crée la table si besoin, l'index de recherche FTS5 (si disponible), puis migre
+    une seule fois l'ancien history.json."""
+    global _FTS_AVAILABLE
+    # 1) Table principale (référence des données) — transaction isolée : elle ne doit
+    #    JAMAIS être compromise par un échec de la partie recherche ci-dessous.
     try:
         with _hist_db() as conn:
             conn.execute(
@@ -498,9 +525,49 @@ def history_init():
                 " ts TEXT NOT NULL,"
                 " mode TEXT NOT NULL,"
                 " text TEXT NOT NULL)")
+    except Exception as e:
+        log(f"history_init (table) : {e}")
+
+    # 2) Index de recherche plein-texte (FTS5). Optionnel : si le SQLite embarqué n'a
+    #    pas le module FTS5, la création échoue → on continue sans (repli LIKE dans
+    #    history_search). L'index « content='entries' » ne duplique pas le texte : il
+    #    pointe vers la table. Des déclencheurs le tiennent à jour automatiquement, et
+    #    « rebuild » resynchronise l'existant à chaque démarrage (auto-réparation,
+    #    négligeable pour ≤ HISTORY_KEEP lignes). tokenize accent-/casse-insensible :
+    #    « reunion » trouve « Réunion ».
+    try:
+        with _hist_db() as conn:
+            conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5("
+                " text, content='entries', content_rowid='id',"
+                " tokenize='unicode61 remove_diacritics 2')")
+            conn.execute(
+                "CREATE TRIGGER IF NOT EXISTS entries_ai AFTER INSERT ON entries BEGIN"
+                " INSERT INTO entries_fts(rowid, text) VALUES (new.id, new.text);"
+                " END")
+            conn.execute(
+                "CREATE TRIGGER IF NOT EXISTS entries_ad AFTER DELETE ON entries BEGIN"
+                " INSERT INTO entries_fts(entries_fts, rowid, text)"
+                " VALUES('delete', old.id, old.text);"
+                " END")
+            conn.execute(
+                "CREATE TRIGGER IF NOT EXISTS entries_au AFTER UPDATE ON entries BEGIN"
+                " INSERT INTO entries_fts(entries_fts, rowid, text)"
+                " VALUES('delete', old.id, old.text);"
+                " INSERT INTO entries_fts(rowid, text) VALUES (new.id, new.text);"
+                " END")
+            conn.execute("INSERT INTO entries_fts(entries_fts) VALUES('rebuild')")
+        _FTS_AVAILABLE = True
+    except Exception as e:
+        _FTS_AVAILABLE = False
+        log(f"Recherche FTS5 indisponible (repli sur balayage simple) : {e}")
+
+    # 3) Migration unique de l'ancien history.json. Après la mise en place des
+    #    déclencheurs : les lignes migrées sont donc indexées au passage.
+    try:
         _history_migrate_json()
     except Exception as e:
-        log(f"history_init : {e}")
+        log(f"history_init (migration) : {e}")
 
 
 def _history_migrate_json():
@@ -632,6 +699,151 @@ def history_clear():
         return False
 
 
+def history_search(query, limit=30):
+    """Recherche plein-texte dans l'historique. Renvoie les entrées correspondantes,
+    les plus pertinentes d'abord (FTS5), ou les plus récentes en repli (LIKE)."""
+    # On ne garde que les termes contenant au moins un caractère alphanumérique :
+    # évite qu'une saisie de ponctuation seule ne produise une requête FTS invalide.
+    terms = [t for t in (query or "").split() if any(c.isalnum() for c in t)]
+    if not terms:
+        return []
+    try:
+        with _hist_db() as conn:
+            if _FTS_AVAILABLE:
+                # Chaque terme → un jeton FTS entre guillemets (neutralise la syntaxe
+                # spéciale) suffixé de « * » (recherche par préfixe : « bud » → « budget »).
+                # Termes multiples = ET implicite (l'entrée doit tous les contenir).
+                match = " ".join('"' + t.replace('"', '""') + '"*' for t in terms)
+                # L'opérateur MATCH doit porter sur le nom réel de la table FTS (pas un
+                # alias, que SQLite prendrait pour une colonne). ORDER BY rank : pertinence.
+                rows = conn.execute(
+                    "SELECT e.id, e.ts, e.mode, e.text"
+                    " FROM entries_fts JOIN entries e ON e.id = entries_fts.rowid"
+                    " WHERE entries_fts MATCH ? ORDER BY rank LIMIT ?",
+                    (match, limit)).fetchall()
+            else:
+                # Repli sans FTS5 : chaque terme doit apparaître (ET). ESCAPE protège
+                # les jokers « % » et « _ » d'une saisie littérale.
+                clauses = " AND ".join(["text LIKE ? ESCAPE '\\'"] * len(terms))
+                params = ["%" + t.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+                          for t in terms]
+                rows = conn.execute(
+                    "SELECT id, ts, mode, text FROM entries"
+                    f" WHERE {clauses} ORDER BY id DESC LIMIT ?",
+                    (*params, limit)).fetchall()
+        return _history_rows_to_dicts(rows)
+    except Exception as e:
+        log(f"history_search : {e}")
+        return []
+
+
+# --------------------------------------------------------------------------- #
+#  Séparation des locuteurs (diarisation) — sherpa-onnx, optionnel
+# --------------------------------------------------------------------------- #
+# sherpa-onnx n'est PAS importé au démarrage : c'est une dépendance facultative, absente
+# tant que l'utilisateur n'active pas la fonction. On l'importe à la demande, une fois.
+_sherpa = None
+_sherpa_tried = False
+
+
+def _load_sherpa():
+    """Importe sherpa_onnx à la demande. Renvoie le module ou None (mémorisé : on ne
+    retente pas l'import à chaque appel). Réinitialisé après une installation à chaud."""
+    global _sherpa, _sherpa_tried
+    if _sherpa_tried:
+        return _sherpa
+    _sherpa_tried = True
+    try:
+        import sherpa_onnx
+        _sherpa = sherpa_onnx
+    except Exception as e:
+        log(f"sherpa-onnx indisponible : {e}")
+        _sherpa = None
+    return _sherpa
+
+
+def diarization_models_present():
+    """True si les deux modèles ONNX sont téléchargés."""
+    return os.path.exists(DIAR_SEG_PATH) and os.path.exists(DIAR_EMB_PATH)
+
+
+def diarization_ready():
+    """True si la diarisation est utilisable MAINTENANT : modèles présents ET module
+    importable. Sert de garde avant chaque tentative (ne casse jamais la transcription)."""
+    return diarization_models_present() and _load_sherpa() is not None
+
+
+def diarize(audio, num_speakers=0, progress=None):
+    """Sépare les locuteurs d'un enregistrement (float32 mono 16 kHz normalisé). Renvoie
+    une liste de tuples (début_s, fin_s, id_locuteur) triés par début, ou None si
+    indisponible/échec. num_speakers : 0 = détection automatique, sinon nombre imposé."""
+    so = _load_sherpa()
+    if so is None or not diarization_models_present():
+        return None
+    try:
+        cfg = so.OfflineSpeakerDiarizationConfig(
+            segmentation=so.OfflineSpeakerSegmentationModelConfig(
+                pyannote=so.OfflineSpeakerSegmentationPyannoteModelConfig(model=DIAR_SEG_PATH)),
+            embedding=so.SpeakerEmbeddingExtractorConfig(
+                model=DIAR_EMB_PATH, num_threads=CPU_THREADS),
+            clustering=so.FastClusteringConfig(
+                num_clusters=(num_speakers if num_speakers and num_speakers > 0 else -1),
+                threshold=0.5),
+            min_duration_on=0.3, min_duration_off=0.5)
+        sd = so.OfflineSpeakerDiarization(cfg)
+        audio = np.asarray(audio, dtype=np.float32)
+
+        def _cb(*a):
+            # sherpa appelle (n_traité, n_total[, arg]) ; on remonte une progression 0-100.
+            if progress is not None and len(a) >= 2 and a[1]:
+                try:
+                    progress(min(100, int(a[0] / a[1] * 100)))
+                except Exception:
+                    pass
+            return 0
+
+        segments = sd.process(audio, callback=_cb).sort_by_start_time()
+        return [(s.start, s.end, s.speaker) for s in segments]
+    except Exception as e:
+        log(f"diarize : {e}")
+        return None
+
+
+def _speaker_at(start, end, diar):
+    """Locuteur (int) dont l'intervalle recouvre le plus [start, end], ou None si aucun."""
+    best, best_ov = None, 0.0
+    for d0, d1, spk in diar:
+        ov = min(end, d1) - max(start, d0)
+        if ov > best_ov:
+            best_ov, best = ov, spk
+    return best
+
+
+def format_with_speakers(seglist, diar, timestamps=False, offset=0.0):
+    """Assemble le texte en préfixant chaque prise de parole par « — Locuteur N : » quand
+    le locuteur change. `seglist` = segments faster-whisper (.start/.end/.text) ; `diar` =
+    sortie de diarize() ; `offset` = décalage (s) des segments dans l'audio diarisé. Renvoie
+    None si `diar` est vide (l'appelant garde alors le rendu habituel)."""
+    if not diar:
+        return None
+    lines = []
+    current = object()   # sentinelle : garantit un en-tête au tout premier segment
+    for s in seglist:
+        txt = s.text.strip()
+        if not txt:
+            continue
+        spk = _speaker_at(s.start + offset, s.end + offset, diar)
+        if spk != current:
+            current = spk
+            label = f"Locuteur {spk + 1}" if spk is not None else "Locuteur ?"
+            if lines:
+                lines.append("")          # ligne vide entre deux locuteurs (lisibilité)
+            lines.append(f"— {label} :")
+        prefix = f"[{fmt_ts(s.start + offset)}] " if timestamps else ""
+        lines.append(f"{prefix}{txt}")
+    return "\n".join(lines).strip()
+
+
 # --------------------------------------------------------------------------- #
 #  Application
 # --------------------------------------------------------------------------- #
@@ -726,6 +938,13 @@ class VoixFlashApp(rumps.App):
     def _build_menu(self):
         self.meeting_item = rumps.MenuItem(MEETING_START_TITLE, callback=self.toggle_meeting)
         self.history_menu = rumps.MenuItem("Historique récent")
+        # Recherche dans l'historique : item de saisie + sous-menu de résultats cliquables.
+        # L'état de la dernière recherche est conservé pour survivre aux reconstructions
+        # du menu d'historique (cf. _fill_search_results).
+        self.search_item = rumps.MenuItem("🔍 Rechercher…", callback=self.search_history)
+        self.search_results_menu = rumps.MenuItem("Résultats de recherche")
+        self._search_query = None
+        self._search_results = []
         self.reunions_menu = rumps.MenuItem("Réunions")
         self.quality_menu = rumps.MenuItem("Qualité / vitesse")
         self.lang_menu = rumps.MenuItem("Langue")
@@ -760,12 +979,22 @@ class VoixFlashApp(rumps.App):
         self.reunions_menu.add(rumps.MenuItem("Exporter la dernière réunion (.txt)",
                                               callback=self.export_last_meeting))
         self.reunions_menu.add(self.ts_item)
+        # Séparation des locuteurs : bascule (installe le module à la 1re activation) +
+        # sous-menu « Locuteurs attendus ». Placés sous une séparation pour les distinguer.
+        self.reunions_menu.add(rumps.separator)
+        self.diar_item = rumps.MenuItem("Séparer les locuteurs (réunions)",
+                                        callback=self.toggle_diarization)
+        self.reunions_menu.add(self.diar_item)
+        self.diar_speakers_menu = rumps.MenuItem("Locuteurs attendus")
+        self.reunions_menu.add(self.diar_speakers_menu)
+        self._diar_installing = False
 
         # Remplissage des sous-menus
         self._refresh_quality_menu()
         self._refresh_lang_menu()
         self._refresh_hotkey_menu()
         self._refresh_history_menu()
+        self._refresh_diar_menu()
         self.ts_item.state = bool(self.config["meeting_timestamps"])
         self.restore_item.state = bool(self.config["restore_clipboard"])
 
@@ -822,6 +1051,12 @@ class VoixFlashApp(rumps.App):
         """Reconstruit le sous-menu d'historique : entrées récentes cliquables (→ fenêtre
         de transcription), puis export et vidage. À appeler sur le thread principal."""
         self._safe_clear(self.history_menu)
+        # Recherche en tête : champ de saisie + sous-menu des résultats (reconstruit à
+        # partir de la dernière recherche pour survivre à ce rafraîchissement).
+        self.history_menu.add(self.search_item)
+        self.history_menu.add(self.search_results_menu)
+        self._fill_search_results()
+        self.history_menu.add(rumps.separator)
         recent = history_recent(15)   # les 15 plus récentes (la plus récente d'abord)
         if not recent:
             self.history_menu.add(rumps.MenuItem("(vide)"))
@@ -983,6 +1218,73 @@ class VoixFlashApp(rumps.App):
                 return
             self._present(self._show_transcript, entry)
         return cb
+
+    # ------------------------------------------------------ recherche historique --
+    def _fill_search_results(self, entry_ids=None):
+        """(Re)construit le sous-menu « Résultats de recherche » à partir de la dernière
+        recherche. Appelé après une recherche ET à chaque reconstruction de l'historique
+        (le menu parent est vidé/reconstruit, mais l'état de recherche persiste).
+        Thread principal."""
+        self._safe_clear(self.search_results_menu)
+        if not self._search_query:
+            self.search_results_menu.add(rumps.MenuItem("(aucune recherche)"))
+            return
+        n = len(self._search_results)
+        # En-tête non cliquable (pas de callback → grisé) : rappelle la requête et le compte.
+        self.search_results_menu.add(rumps.MenuItem(f"« {self._search_query} » — {n} résultat·s"))
+        if not self._search_results:
+            return
+        self.search_results_menu.add(rumps.separator)
+        for i, entry in enumerate(self._search_results):
+            preview = " ".join((entry.get("text") or "").split())
+            if len(preview) > 44:
+                preview = preview[:44] + "…"
+            tag = "Réunion" if entry.get("mode") == "meeting" else "Dictée"
+            # Le numéro garantit un titre unique (menus rumps indexés par titre).
+            title = f"{i + 1}.  {tag} · {preview}"
+            self.search_results_menu.add(
+                rumps.MenuItem(title, callback=self._make_history_cb(entry["id"])))
+
+    def search_history(self, _sender):
+        """Item « 🔍 Rechercher… » : saisit des mots-clés, cherche dans l'historique, et
+        remplit le sous-menu « Résultats de recherche » (cliquable → fenêtre de
+        transcription). Callback de menu → thread principal : la fenêtre modale est
+        légitime ici (comme rumps.alert / le sélecteur de fichier)."""
+        try:
+            win = rumps.Window(
+                title="Rechercher dans l'historique",
+                message="Tape un ou plusieurs mots-clés, puis « Chercher ».\n"
+                        "Plusieurs mots = toutes les entrées qui les contiennent tous.\n"
+                        "Les résultats apparaissent dans le sous-menu « Résultats de recherche ».",
+                ok="Chercher",
+                cancel="Annuler",
+                dimensions=(300, 22),
+            )
+            resp = win.run()
+        except Exception as e:
+            log(f"search_history (fenêtre) : {e}")
+            return
+        # Le bouton OK (« Chercher ») vaut clicked == 1 (cf. _show_transcript) ; toute
+        # autre valeur = Annuler / Échap → on abandonne sans rien changer.
+        if resp.clicked != 1:
+            return
+        query = " ".join((resp.text or "").split())
+        if not query:
+            self._show_info("Recherche vide", "Aucun mot-clé saisi.")
+            return
+        results = history_search(query)
+        self._search_query = query
+        self._search_results = results
+        self._fill_search_results()
+        if results:
+            self._show_info(
+                "Résultats de recherche",
+                f"{len(results)} résultat·s pour « {query} ».\n\n"
+                "Ouvre le menu VoixFlash › « Historique récent » › "
+                "« Résultats de recherche ».")
+        else:
+            self._show_info("Aucun résultat",
+                            f"Aucune entrée d'historique ne contient « {query} ».")
 
     # ----------------------------------------------------- icône d'état (barre) --
     def _symbol_image(self, symbol_name):
@@ -1303,7 +1605,26 @@ class VoixFlashApp(rumps.App):
             )
             seglist = list(segments)
 
-            if mode == "meeting" and self.config["meeting_timestamps"]:
+            # Séparation des locuteurs (réunions uniquement, si activée et prête). On tient
+            # tout l'audio en mémoire ici, donc les identités de locuteurs sont cohérentes
+            # sur toute la réunion. Un échec de diarisation NE casse jamais la transcription :
+            # format_with_speakers renvoie None et on retombe sur le rendu habituel.
+            diar_text = None
+            if (mode == "meeting" and self.config.get("diarization_enabled")
+                    and diarization_ready()):
+                # La diarisation ne doit JAMAIS faire perdre la transcription : toute erreur
+                # ici (config, modèle, mémoire) retombe silencieusement sur le texte simple.
+                try:
+                    diar = diarize(audio, int(self.config.get("diarization_speakers", 0)))
+                    diar_text = format_with_speakers(
+                        seglist, diar, timestamps=bool(self.config["meeting_timestamps"]))
+                except Exception as e:
+                    log(f"diarisation ignorée (repli sur texte simple) : {e}")
+                    diar_text = None
+
+            if diar_text is not None:
+                text = diar_text
+            elif mode == "meeting" and self.config["meeting_timestamps"]:
                 # L'horodatage est fourni gratuitement par faster-whisper (start de
                 # chaque segment) : on l'ajoute seulement si l'option est activée.
                 text = "\n".join(f"[{fmt_ts(s.start)}] {s.text.strip()}" for s in seglist).strip()
@@ -1445,6 +1766,24 @@ class VoixFlashApp(rumps.App):
                 elif kind == "info":
                     title, msg = payload
                     self._present(self._show_info, title, msg)
+                elif kind == "diar_installed":
+                    # Fin de l'installation du module de séparation des locuteurs.
+                    self.diar_item.title = "Séparer les locuteurs (réunions)"
+                    if payload:
+                        self.config["diarization_enabled"] = True
+                        save_json(CONFIG_PATH, self.config)
+                        self._refresh_diar_menu()
+                        self._present(self._show_info, "Séparation des locuteurs activée",
+                                      "C'est prêt ! Tes prochaines réunions distingueront "
+                                      "« Locuteur 1 », « Locuteur 2 », etc.\n\nAstuce : indique "
+                                      "le nombre de personnes dans « Réunions › Locuteurs "
+                                      "attendus » si tu le connais — sinon, laisse « Automatique ».")
+                    else:
+                        self._refresh_diar_menu()
+                        self._present(self._show_error,
+                                      "Le module de séparation des locuteurs n'a pas pu être "
+                                      "installé (téléchargement interrompu ou connexion coupée). "
+                                      "Réessaie depuis « Réunions › Séparer les locuteurs ».")
                 elif kind == "welcome":
                     self._present(self._show_welcome)
         except Exception as e:
@@ -1799,6 +2138,195 @@ class VoixFlashApp(rumps.App):
         sender.state = self.config["restore_clipboard"]
         save_json(CONFIG_PATH, self.config)
 
+    # ---------------------------------------------- séparation des locuteurs (menu) --
+    def _refresh_diar_menu(self):
+        """Coche l'état de la diarisation et (re)construit le sous-menu « Locuteurs attendus »."""
+        self.diar_item.state = bool(self.config.get("diarization_enabled"))
+        self._safe_clear(self.diar_speakers_menu)
+        current = int(self.config.get("diarization_speakers", 0))
+        for label, val in DIAR_SPEAKER_CHOICES:
+            item = rumps.MenuItem(label, callback=self._make_diar_speakers_cb(val))
+            item.state = (current == val)
+            self.diar_speakers_menu.add(item)
+
+    def _make_diar_speakers_cb(self, val):
+        def cb(_sender):
+            self.config["diarization_speakers"] = val
+            save_json(CONFIG_PATH, self.config)
+            self._refresh_diar_menu()
+        return cb
+
+    def toggle_diarization(self, _sender):
+        """Active / désactive la séparation des locuteurs. À la 1re activation, propose
+        d'installer le petit module nécessaire (sherpa-onnx + modèles ONNX depuis GitHub) :
+        aucun compte, aucune configuration, hors-ligne ensuite."""
+        # Déjà activée → simple désactivation.
+        if self.config.get("diarization_enabled"):
+            self.config["diarization_enabled"] = False
+            save_json(CONFIG_PATH, self.config)
+            self._refresh_diar_menu()
+            return
+        # Installation déjà en cours → on ignore un second clic.
+        if self._diar_installing:
+            self._show_info("Installation en cours",
+                            "Le module de séparation des locuteurs s'installe. Un message "
+                            "s'affichera dès que ce sera prêt.")
+            return
+        # Module déjà présent → activation immédiate.
+        if diarization_ready():
+            self.config["diarization_enabled"] = True
+            save_json(CONFIG_PATH, self.config)
+            self._refresh_diar_menu()
+            self._show_info(
+                "Séparation des locuteurs activée",
+                "Tes prochaines réunions distingueront « Locuteur 1 », « Locuteur 2 », etc.\n\n"
+                "Astuce : si tu connais le nombre de personnes, indique-le dans « Réunions › "
+                "Locuteurs attendus ». Sinon laisse « Automatique ».")
+            return
+        # Sinon : proposer le téléchargement (une seule fois).
+        if not self._confirm(
+                "La séparation des locuteurs indique « qui parle » dans tes réunions "
+                "(« Locuteur 1 : … », « Locuteur 2 : … »).\n\n"
+                "Pour l'activer, VoixFlash télécharge un petit module (~50 Mo) une seule "
+                "fois. Tout reste sur ton Mac : aucun compte, rien à configurer, et ça "
+                "fonctionne ensuite hors-ligne.\n\n"
+                "Note : la séparation est fiable sur des voix distinctes ; elle se dégrade "
+                "quand plusieurs personnes parlent en même temps.\n\n"
+                "Lancer le téléchargement maintenant ?",
+                ok="Télécharger et activer", cancel="Plus tard"):
+            return
+        self._diar_installing = True
+        self.diar_item.title = "Installation de la séparation des locuteurs…"
+        threading.Thread(target=self._install_diarization, daemon=True).start()
+
+    def _install_diarization(self):
+        """Thread de fond : installe sherpa-onnx (via uv, comme le reste de l'app) puis
+        télécharge les 2 modèles ONNX depuis GitHub. Ne touche jamais l'UI directement :
+        tout retour passe par self._ui_queue (« diar_installed »)."""
+        ok = False
+        try:
+            # 1) sherpa-onnx dans le venv de l'app, s'il n'est pas déjà importable.
+            if _load_sherpa() is None:
+                self._ui_queue.put(("info", ("Téléchargement du module",
+                                             "Installation du moteur de séparation… "
+                                             "(quelques minutes selon ta connexion).")))
+                if not self._pip_install("sherpa-onnx"):
+                    raise RuntimeError("installation de sherpa-onnx impossible")
+                # Réinitialise le cache d'import pour retenter après installation.
+                global _sherpa, _sherpa_tried
+                _sherpa = None
+                _sherpa_tried = False
+                if _load_sherpa() is None:
+                    raise RuntimeError("sherpa-onnx installé mais non importable")
+            # 2) Modèles ONNX (idempotent : on ne retélécharge pas ce qui est déjà là).
+            os.makedirs(DIAR_DIR, exist_ok=True)
+            if not os.path.exists(DIAR_SEG_PATH):
+                self._download_seg_model()
+            if not os.path.exists(DIAR_EMB_PATH):
+                self._download_file(DIAR_EMB_URL, DIAR_EMB_PATH)
+            ok = diarization_ready()
+        except Exception as e:
+            log(f"installation diarisation : {e}")
+            ok = False
+        finally:
+            self._diar_installing = False
+            self._ui_queue.put(("diar_installed", ok))
+
+    @staticmethod
+    def _find_uv():
+        """Localise l'outil `uv` (celui utilisé par l'installateur). Le venv de l'app est
+        créé sans pip → uv est la voie fiable pour installer un paquet à chaud."""
+        import shutil
+        for c in (shutil.which("uv"),
+                  os.path.expanduser("~/.local/bin/uv"),
+                  os.path.expanduser("~/.cargo/bin/uv")):
+            if c and os.path.exists(c):
+                return c
+        return None
+
+    def _pip_install(self, pkg):
+        """Installe un paquet dans le venv de l'app. uv d'abord (venv sans pip), puis
+        repli sur `python -m pip` (avec amorçage ensurepip si besoin)."""
+        py = sys.executable
+        uv = self._find_uv()
+        attempts = []
+        if uv:
+            attempts.append([uv, "pip", "install", "--python", py, pkg])
+        attempts.append([py, "-m", "pip", "install", pkg])
+        for cmd in attempts:
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+                if r.returncode == 0:
+                    return True
+                log(f"pip install {pkg} ({os.path.basename(cmd[0])}) rc={r.returncode} : "
+                    f"{(r.stderr or '')[-300:]}")
+            except Exception as e:
+                log(f"pip install {pkg} ({os.path.basename(cmd[0])}) : {e}")
+        # Dernier recours : amorcer pip dans le venv puis réessayer une fois.
+        try:
+            subprocess.run([py, "-m", "ensurepip", "--upgrade"],
+                           capture_output=True, text=True, timeout=180)
+            r = subprocess.run([py, "-m", "pip", "install", pkg],
+                               capture_output=True, text=True, timeout=900)
+            return r.returncode == 0
+        except Exception as e:
+            log(f"ensurepip+pip {pkg} : {e}")
+            return False
+
+    @staticmethod
+    def _download_file(url, dest):
+        """Télécharge une URL vers `dest` de façon atomique (fichier .part puis renommage :
+        pas de fichier à moitié écrit si l'opération est interrompue)."""
+        import urllib.request
+        tmp = dest + ".part"
+        # User-Agent explicite : certains CDN/miroirs refusent « Python-urllib » par défaut.
+        req = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r, open(tmp, "wb") as f:
+                while True:
+                    chunk = r.read(1 << 16)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+            os.replace(tmp, dest)
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+
+    def _download_seg_model(self):
+        """Télécharge l'archive de segmentation (.tar.bz2) et en extrait model.onnx vers
+        DIAR_SEG_PATH (écriture atomique)."""
+        import urllib.request
+        import tarfile
+        tmp = DIAR_SEG_PATH + ".tar.bz2"
+        req = urllib.request.Request(DIAR_SEG_URL, headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r, open(tmp, "wb") as f:
+                while True:
+                    chunk = r.read(1 << 16)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+            with tarfile.open(tmp, "r:bz2") as tar:
+                member = next((m for m in tar.getmembers()
+                               if m.name.endswith("model.onnx")), None)
+                if member is None:
+                    raise RuntimeError("model.onnx introuvable dans l'archive de segmentation")
+                src = tar.extractfile(member)
+                with open(DIAR_SEG_PATH + ".part", "wb") as out:
+                    out.write(src.read())
+            os.replace(DIAR_SEG_PATH + ".part", DIAR_SEG_PATH)
+        finally:
+            for p in (tmp, DIAR_SEG_PATH + ".part"):
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except OSError:
+                    pass
+
     def export_last_meeting(self, _sender):
         """Exporte la dernière réunion en fichier .txt daté (révélé dans le Finder)."""
         entry = history_last_meeting()
@@ -1983,8 +2511,16 @@ class VoixFlashApp(rumps.App):
             "  choisie : « small » ≈ 1 h d'audio en ~15 min ; « medium » est plus lent.\n"
             "  Un fichier de 2 h passe sans souci (découpage automatique). Au-delà de\n"
             "  30 min, un message annonce une estimation avant de lancer.\n"
-            "• L'import ne SÉPARE PAS les locuteurs (pas de « — Jean : … ») : c'est un\n"
-            "  texte continu. Les fichiers protégés (DRM, ex. Apple Music) sont refusés.\n"
+            "• L'import ne SÉPARE PAS les locuteurs (c'est un texte continu). La séparation\n"
+            "  « qui parle » n'existe que pour les RÉUNIONS enregistrées en direct (voir la\n"
+            "  section ci-dessous). Les fichiers protégés (DRM, Apple Music) sont refusés.\n"
+            "\n"
+            "• SÉPARER LES LOCUTEURS (réunions) : « Réunions › Séparer les locuteurs »\n"
+            "  télécharge une seule fois un petit module (~50 Mo, depuis GitHub, sans compte)\n"
+            "  et affiche ensuite « — Locuteur 1 : … », « — Locuteur 2 : … » dans tes réunions.\n"
+            "  Tout reste sur ton Mac. Indique le nombre de personnes dans « Locuteurs\n"
+            "  attendus » si tu le connais (sinon « Automatique »). La séparation est fiable\n"
+            "  sur des voix distinctes et se dégrade quand plusieurs parlent en même temps.\n"
             "• Une seule transcription à la fois : pendant un import ou une réunion, on ne\n"
             "  peut pas en lancer une autre (un message le rappelle).\n"
             "\n"
