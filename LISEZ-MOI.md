@@ -113,8 +113,9 @@ pastille d'enregistrement = enregistre · forme d'onde = transcrit · presse-pap
 - **Réunions › Séparer les locuteurs** : affiche « — Locuteur 1 : … », « — Locuteur 2 : … »
   dans tes réunions. La **1re activation** télécharge un petit module (~50 Mo, depuis GitHub,
   **sans compte ni clé**) ; ensuite tout est hors-ligne. **Réunions › Locuteurs attendus** :
-  laisse **Automatique**, ou indique le nombre de personnes (plus fiable). La séparation
-  fonctionne bien sur des voix distinctes et se dégrade quand plusieurs parlent en même temps.
+  laisse **Automatique**, ou indique le nombre de personnes **seulement si tu en es sûr**
+  (un nombre trop grand découpe une vraie voix en plusieurs). La séparation fonctionne bien
+  sur des voix distinctes et se dégrade quand plusieurs parlent en même temps.
 - **Restaurer le presse-papiers après une dictée** : remet ton ancien presse-papiers (activé).
 
 > Le **1er choix** d'une qualité télécharge le modèle une fois (jusqu'à ~1 min pour

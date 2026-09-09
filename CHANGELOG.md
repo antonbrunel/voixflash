@@ -28,6 +28,13 @@
 - **Longues réunions.** Le pic de mémoire d'une réunion d'une heure passe d'environ 4,4 Go à
   1 Go : assemblage de l'audio au fil de l'eau et rééchantillonnage par tranches, à résultat
   identique. C'était la cause probable des arrêts brutaux sur les enregistrements longs.
+- **Moins de locuteurs fantômes.** En mode automatique, une longue réunion était découpée en
+  trop de locuteurs (une même voix éclatée en plusieurs personnes). Le regroupement des voix
+  est maintenant plus tolérant à mesure que la réunion s'allonge. Par ailleurs, tout
+  « locuteur » qui totalise moins d'une seconde de parole (un rire, une sonnerie) est écarté,
+  les locuteurs sont numérotés dans l'ordre où on les entend pour la première fois, et un
+  passage tombé entre deux prises de parole est rattaché à la plus proche au lieu d'afficher
+  « Locuteur ? ».
 
 ## 1.3.0 — fiabilité
 

@@ -1109,6 +1109,59 @@ def diarization_ready():
     return diarization_models_present() and _load_sherpa() is not None
 
 
+def clustering_threshold(duration_s):
+    """Seuil de regroupement des voix, croissant avec la durée de l'enregistrement.
+
+    Plus l'enregistrement est long, plus une même voix varie (fatigue, distance au
+    micro, sujet), et plus le regroupement automatique la découpe en plusieurs
+    locuteurs. Un seuil fixe sur-segmente donc les longues réunions. La montée de
+    0,55 à 0,80 entre 15 et 60 minutes vient d'un projet qui utilise exactement la
+    même pile que nous (sherpa-onnx + pyannote 3.0) et qui avait observé le cas
+    extrême : 46 locuteurs détectés sur 73 minutes.
+
+    Dans sherpa-onnx c'est une DISTANCE : plus le seuil est haut, plus on fusionne.
+    Vérifié sur de la vraie parole plutôt que déduit de la documentation (un moteur
+    concurrent convertit ce réglage en interne, si bien que l'augmenter y découpe
+    DAVANTAGE) : mesures 0,45 → 4 locuteurs, 0,55 → 3, 0,85 → 1 sur un même audio.
+
+    Le plancher reste à 0,50, la valeur utilisée jusqu'ici : sur les enregistrements
+    courts aucune sur-segmentation n'a été constatée, et la mesure ne départage pas
+    0,50 de 0,55. On ne change donc que ce qui pose réellement problème."""
+    low_s, high_s, low_t, high_t = 900.0, 3600.0, 0.50, 0.80
+    if duration_s <= low_s:
+        return low_t
+    if duration_s >= high_s:
+        return high_t
+    ratio = (duration_s - low_s) / (high_s - low_s)
+    return low_t + ratio * (high_t - low_t)
+
+
+def drop_micro_speakers(diar, min_total=1.0):
+    """Supprime les locuteurs qui ne totalisent presque aucune parole, et renumérote.
+
+    Un rire, une sonnerie, une raclement de gorge suffisent à créer un « locuteur »
+    fantôme. On écarte ceux qui parlent moins d'une seconde en tout, puis on
+    renumérote par ordre de PREMIÈRE prise de parole : « Locuteur 1 » est alors
+    vraiment la première personne entendue, ce que l'ordre de sortie du moteur ne
+    garantit pas."""
+    if not diar:
+        return diar
+    totals, first = {}, {}
+    for start, end, spk in diar:
+        totals[spk] = totals.get(spk, 0.0) + max(0.0, end - start)
+        if spk not in first or start < first[spk]:
+            first[spk] = start
+    kept = [s for s, t in totals.items() if t >= min_total]
+    if not kept:
+        kept = list(totals)                      # jamais tout jeter
+    if len(kept) < len(totals):
+        log(f"diarisation : {len(totals) - len(kept)} locuteur(s) fantôme(s) écarté(s) "
+            f"(moins de {min_total:g} s de parole).")
+    order = sorted(kept, key=lambda s: first[s])
+    renum = {old: new for new, old in enumerate(order)}
+    return [(start, end, renum[spk]) for (start, end, spk) in diar if spk in renum]
+
+
 def diarize(audio, num_speakers=0, progress=None):
     """Sépare les locuteurs d'un enregistrement (float32 mono 16 kHz normalisé). Renvoie
     une liste de tuples (début_s, fin_s, id_locuteur) triés par début, ou None si
@@ -1117,6 +1170,9 @@ def diarize(audio, num_speakers=0, progress=None):
     if so is None or not diarization_models_present():
         return None
     try:
+        threshold = clustering_threshold(len(audio) / 16000.0)
+        log(f"diarisation : seuil de regroupement {threshold:.2f} "
+            f"({len(audio) / 16000.0 / 60.0:.0f} min d'audio).")
         cfg = so.OfflineSpeakerDiarizationConfig(
             segmentation=so.OfflineSpeakerSegmentationModelConfig(
                 pyannote=so.OfflineSpeakerSegmentationPyannoteModelConfig(model=DIAR_SEG_PATH)),
@@ -1124,7 +1180,7 @@ def diarize(audio, num_speakers=0, progress=None):
                 model=DIAR_EMB_PATH, num_threads=CPU_THREADS),
             clustering=so.FastClusteringConfig(
                 num_clusters=(num_speakers if num_speakers and num_speakers > 0 else -1),
-                threshold=0.5),
+                threshold=threshold),
             min_duration_on=0.3, min_duration_off=0.5)
         sd = so.OfflineSpeakerDiarization(cfg)
         audio = np.asarray(audio, dtype=np.float32)
@@ -1139,20 +1195,33 @@ def diarize(audio, num_speakers=0, progress=None):
             return 0
 
         segments = sd.process(audio, callback=_cb).sort_by_start_time()
-        return [(s.start, s.end, s.speaker) for s in segments]
+        return drop_micro_speakers([(s.start, s.end, s.speaker) for s in segments])
     except Exception as e:
         log(f"diarize : {e}")
         return None
 
 
 def _speaker_at(start, end, diar):
-    """Locuteur (int) dont l'intervalle recouvre le plus [start, end], ou None si aucun."""
+    """Locuteur (int) dont l'intervalle recouvre le plus [start, end].
+
+    Sans recouvrement (passage tombé dans un trou de la segmentation, ou dans la
+    plage d'un locuteur fantôme écarté), on se rabat sur la prise de parole la plus
+    proche dans le temps. Sans ce repli, ces passages s'affichaient « Locuteur ? »
+    et se lisaient comme un participant supplémentaire qui n'existe pas."""
     best, best_ov = None, 0.0
     for d0, d1, spk in diar:
         ov = min(end, d1) - max(start, d0)
         if ov > best_ov:
             best_ov, best = ov, spk
-    return best
+    if best is not None:
+        return best
+    mid = (start + end) / 2.0
+    nearest, nearest_gap = None, None
+    for d0, d1, spk in diar:
+        gap = 0.0 if d0 <= mid <= d1 else min(abs(mid - d0), abs(mid - d1))
+        if nearest_gap is None or gap < nearest_gap:
+            nearest_gap, nearest = gap, spk
+    return nearest
 
 
 def format_with_speakers(seglist, diar, timestamps=False, offset=0.0):
@@ -3246,8 +3315,9 @@ class VoixFlashApp(rumps.App):
             self._show_info(
                 "Séparation des locuteurs activée",
                 "Tes prochaines réunions distingueront « Locuteur 1 », « Locuteur 2 », etc.\n\n"
-                "Astuce : si tu connais le nombre de personnes, indique-le dans « Réunions › "
-                "Locuteurs attendus ». Sinon laisse « Automatique ».")
+                "Astuce : indique le nombre de personnes dans « Réunions › Locuteurs "
+                "attendus » seulement si tu en es SÛR — un nombre trop grand découpe une "
+                "vraie voix en plusieurs. Dans le doute, laisse « Automatique ».")
             return
         # Sinon : proposer le téléchargement (une seule fois).
         if not self._confirm(
