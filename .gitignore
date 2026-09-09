@@ -21,6 +21,10 @@ config.json
 # --- Outils / divers ---
 .firecrawl/
 
+# --- Notes de travail internes (veille, analyses) : sans valeur pour qui installe
+#     l'outil, cf. le retrait du compte rendu de session en 8510695 ---
+/docs/
+
 # --- Artefacts de distribution (générés par build-release.command) ---
 /dist/
 /build/

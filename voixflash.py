@@ -1015,6 +1015,13 @@ class VoixFlashApp(rumps.App):
         self._disk_thread = None          # thread qui écrit le fichier brut
         self._disk_paths = None           # (raw, json) de la sauvegarde en cours
         self._lock = threading.Lock()
+        # Restauration du presse-papiers après un collage (cf. _paste_text). La
+        # « génération » sert aux dictées enchaînées : seule la plus récente a le
+        # droit de restaurer, et c'est TOUJOURS le presse-papiers d'origine de
+        # l'utilisateur qui est restauré, jamais le texte de la dictée précédente.
+        self._pb_lock = threading.Lock()
+        self._pb_gen = 0
+        self._pb_pending = None           # (génération, instantané, changeCount à nous)
         self._hotkey = parse_hotkey(self.config["hotkey"])
         self._listener = None
 
@@ -1807,12 +1814,7 @@ class VoixFlashApp(rumps.App):
                 except Exception as e:
                     log(f"fermeture flux : {e}")
             backup = self._stop_disk_backup()
-            if frames:
-                # int16 -> float32 normalisé dans [-1, 1], ce qu'attend Whisper.
-                audio = np.concatenate(frames, axis=0).flatten().astype(np.float32) / 32768.0
-            else:
-                audio = np.zeros(0, dtype=np.float32)
-            frames.clear()           # libère la mémoire int16 avant la transcription
+            audio = self._frames_to_float32(frames)
             log(f"Enregistrement arrêté ({mode}) : {len(audio) / max(1, record_sr):.1f} s "
                 f"d'audio, flux fermé en {time.monotonic() - t0:.1f} s.")
             self._process_audio(audio, record_sr, mode, backup=backup)
@@ -1824,16 +1826,56 @@ class VoixFlashApp(rumps.App):
                 self._transcribing = False
                 self._transcribing_meeting = False
 
+    @staticmethod
+    def _frames_to_float32(frames):
+        """Assemble les blocs int16 en UN tableau float32 normalisé dans [-1, 1].
+
+        Conversion bloc par bloc, chaque bloc étant libéré dès qu'il est recopié.
+        Un np.concatenate suivi d'un .astype puis d'une division ferait coexister
+        l'int16 complet, sa copie float32 et le résultat de la division : près de
+        trois fois la taille finale. Sur une réunion d'une heure (350 Mo d'int16),
+        le pic dépassait le gigaoctet et l'app pouvait être tuée par le système."""
+        total = sum(len(b) for b in frames)
+        if total == 0:
+            frames.clear()
+            return np.zeros(0, dtype=np.float32)
+        audio = np.empty(total, dtype=np.float32)
+        pos = 0
+        for i, blk in enumerate(frames):
+            n = len(blk)
+            audio[pos:pos + n] = blk.reshape(-1)   # int16 -> float32 à l'affectation
+            pos += n
+            frames[i] = None                       # libère l'int16 immédiatement
+        frames.clear()
+        audio /= 32768.0                           # normalisation sur place
+        return audio
+
     def _resample(self, audio, sr_in, sr_out=16000):
-        """Rééchantillonnage simple (interpolation linéaire), utilisé en repli."""
+        """Rééchantillonnage simple (interpolation linéaire), par tranches.
+
+        La version directe (deux linspace plus np.interp) travaillait en float64 sur
+        la TOTALITÉ du signal : pour une réunion d'une heure à 48 kHz, la seule grille
+        d'entrée pesait 1,4 Go, et le pic cumulé dépassait les 3 Go. On découpe donc
+        la sortie en tranches, ce qui ramène le surcoût à quelques dizaines de Mo.
+        Résultat numériquement identique à l'ancienne formule."""
         if sr_in == sr_out or len(audio) == 0:
             return audio
-        n_out = int(round(len(audio) * sr_out / sr_in))
+        n_in = len(audio)
+        n_out = int(round(n_in * sr_out / sr_in))
         if n_out <= 0:
             return np.zeros(0, dtype=np.float32)
-        x_old = np.linspace(0.0, 1.0, num=len(audio), endpoint=False)
-        x_new = np.linspace(0.0, 1.0, num=n_out, endpoint=False)
-        return np.interp(x_new, x_old, audio).astype(np.float32)
+        out = np.empty(n_out, dtype=np.float32)
+        ratio = n_in / n_out
+        CHUNK = 1 << 20
+        for start in range(0, n_out, CHUNK):
+            stop = min(start + CHUNK, n_out)
+            pos = np.arange(start, stop, dtype=np.float64) * ratio
+            left = np.floor(pos).astype(np.int64)
+            frac = pos - left
+            np.clip(left, 0, n_in - 1, out=left)
+            right = np.minimum(left + 1, n_in - 1)
+            out[start:stop] = audio[left] * (1.0 - frac) + audio[right] * frac
+        return out
 
     # ----------------------------------------------------- transcription --
     def _process_audio(self, audio, sr, mode, backup=None):
@@ -2043,6 +2085,98 @@ class VoixFlashApp(rumps.App):
         r = self._run([PBPASTE], capture_output=True, env=CLIP_ENV, timeout=5)
         return r.stdout if r is not None else b""
 
+    @staticmethod
+    def _pasteboard():
+        """Presse-papiers système via pyobjc, ou None (repli pbcopy/pbpaste)."""
+        try:
+            from AppKit import NSPasteboard
+            return NSPasteboard.generalPasteboard()
+        except Exception as e:
+            log(f"NSPasteboard indisponible : {e}")
+            return None
+
+    @staticmethod
+    def _pb_snapshot(pb):
+        """Copie INDÉPENDANTE du presse-papiers : tous les éléments, tous leurs types.
+
+        Indispensable : une image, un fichier ou du texte enrichi ne survivent pas à
+        un aller-retour par pbpaste, qui ne rend que du texte brut. Les données sont
+        recopiées (dataWithData_) car celles de l'original deviennent invalides dès
+        que le presse-papiers est vidé."""
+        try:
+            from AppKit import NSData
+            snap = []
+            for item in (pb.pasteboardItems() or []):
+                entry = []
+                for t in (item.types() or []):
+                    d = item.dataForType_(t)
+                    if d is not None:
+                        entry.append((t, NSData.dataWithData_(d)))
+                if entry:
+                    snap.append(entry)
+            return snap
+        except Exception as e:
+            log(f"lecture du presse-papiers : {e}")
+            return None
+
+    @staticmethod
+    def _pb_write_dictation(pb, text):
+        """Écrit la dictée et renvoie le changeCount qui nous appartient (ou None).
+
+        Les types « org.nspasteboard.* » demandent aux gestionnaires de presse-papiers
+        (Raycast, Alfred, Maccy, Paste) de NE PAS archiver le contenu : une dictée est
+        de passage, elle n'a rien à faire dans un historique tiers."""
+        try:
+            from AppKit import NSPasteboardItem, NSPasteboardTypeString
+            item = NSPasteboardItem.alloc().init()
+            item.setString_forType_(text, NSPasteboardTypeString)
+            for marker in ("org.nspasteboard.TransientType",
+                           "org.nspasteboard.ConcealedType",
+                           "org.nspasteboard.AutoGeneratedType"):
+                item.setString_forType_("", marker)
+            item.setString_forType_(APP_NAME, "org.nspasteboard.source")
+            pb.clearContents()
+            if not pb.writeObjects_([item]):
+                return None
+            return int(pb.changeCount())
+        except Exception as e:
+            log(f"écriture du presse-papiers : {e}")
+            return None
+
+    @staticmethod
+    def _pb_restore(pb, snap):
+        """Réécrit l'instantané pris avant le collage."""
+        try:
+            from AppKit import NSPasteboardItem
+            items = []
+            for entry in snap:
+                item = NSPasteboardItem.alloc().init()
+                for (t, d) in entry:
+                    item.setData_forType_(d, t)
+                items.append(item)
+            pb.clearContents()
+            if items:
+                pb.writeObjects_(items)
+        except Exception as e:
+            log(f"restauration du presse-papiers : {e}")
+
+    def _pb_restore_later(self, pb, gen):
+        """Restaure le presse-papiers, mais SEULEMENT s'il est encore le nôtre.
+
+        Deux abandons volontaires : une dictée plus récente a pris la main (génération
+        différente), ou l'utilisateur a copié quelque chose entre-temps (changeCount
+        différent). Dans les deux cas son geste gagne : restaurer à l'aveugle après un
+        délai fixe écrase le travail de l'utilisateur, c'est un bug silencieux."""
+        with self._pb_lock:
+            pending = self._pb_pending
+            if pending is None or pending[0] != gen:
+                return
+            _, snap, ours = pending
+            self._pb_pending = None
+            if int(pb.changeCount()) != ours:
+                return
+        self._pb_restore(pb, snap)
+
     def _paste_text(self, text):
         """Colle le texte au curseur : presse-papiers + Cmd+V simulé (jamais lettre par lettre)."""
         # Sans l'autorisation « Accessibilité », le Cmd+V simulé n'aurait aucun effet
@@ -2053,29 +2187,71 @@ class VoixFlashApp(rumps.App):
             self._ui_queue.put(("error", "Texte copié, mais collage automatique impossible : "
                                          "autorise « Accessibilité » dans les réglages, puis « Redémarrer VoixFlash »."))
             return
-        old = self._get_clipboard_bytes() if self.config["restore_clipboard"] else None
-        self._set_clipboard(text)
-        time.sleep(0.12)        # court délai pour que tout soit prêt avant le collage
+        pb = self._pasteboard()
+        if pb is None:
+            self._paste_text_basic(text)
+            return
+        restore = bool(self.config.get("restore_clipboard", True))
+        with self._pb_lock:
+            self._pb_gen += 1
+            gen = self._pb_gen
+            pending = self._pb_pending
+            if restore and pending is not None and int(pb.changeCount()) == pending[2]:
+                # Dictée enchaînée : le presse-papiers contient NOTRE texte précédent.
+                # On conserve l'instantané d'origine plutôt que de photographier
+                # la dictée précédente, sinon elle deviendrait le « contenu à rendre ».
+                snap = pending[1]
+            else:
+                snap = self._pb_snapshot(pb) if restore else None
+            self._pb_pending = None
+        ours = self._pb_write_dictation(pb, text)
+        if ours is None:
+            # Écriture refusée : surtout ne pas envoyer un Cmd+V à l'aveugle, il
+            # collerait le contenu PRÉCÉDENT du presse-papiers.
+            self._ui_queue.put(("error", "Le presse-papiers n'a pas pu être écrit ; texte conservé dans l'historique."))
+            return
+        if snap is not None:
+            with self._pb_lock:
+                self._pb_pending = (gen, snap, ours)
         self._send_cmd_v()
-        # On ne restaure que s'il y avait réellement du texte : on évite ainsi
-        # d'effacer une image ou un fichier qui aurait été copié auparavant.
+        if snap is not None:
+            # Assez tard pour que l'application cible ait lu le presse-papiers, assez
+            # tôt pour ne pas retenir en otage celui de l'utilisateur.
+            threading.Timer(0.6, self._pb_restore_later, args=(pb, gen)).start()
+
+    def _paste_text_basic(self, text):
+        """Repli sans pyobjc : presse-papiers texte seul (comportement historique)."""
+        old = self._get_clipboard_bytes() if self.config.get("restore_clipboard", True) else None
+        self._set_clipboard(text)
+        time.sleep(0.12)
+        self._send_cmd_v()
         if old is not None and old.strip():
-            time.sleep(0.6)     # bien après que le collage a eu lieu
-            self._run([PBCOPY], input=old, env=CLIP_ENV, timeout=5)
+            time.sleep(0.6)
+            if self._get_clipboard_bytes() == text.encode("utf-8"):
+                self._run([PBCOPY], input=old, env=CLIP_ENV, timeout=5)
 
     def _send_cmd_v(self):
         """Simule l'appui Cmd+V (nécessite l'autorisation Accessibilité)."""
         try:
             from Quartz import (
                 CGEventCreateKeyboardEvent, CGEventPost, CGEventSetFlags,
+                CGEventSourceCreate, kCGEventSourceStatePrivate,
                 kCGHIDEventTap, kCGEventFlagMaskCommand,
             )
-            V_KEYCODE = 9  # code de la touche « v »
-            down = CGEventCreateKeyboardEvent(None, V_KEYCODE, True)
+            # Source PRIVÉE, et non l'état système : sinon les modificateurs encore
+            # PHYSIQUEMENT enfoncés au moment du collage (typiquement notre propre
+            # touche de dictée, qu'on vient à peine de relâcher) se mélangent aux
+            # nôtres et produisent un Cmd+Maj+V au lieu d'un Cmd+V.
+            src = CGEventSourceCreate(kCGEventSourceStatePrivate)
+            # Code de la touche « v » en QWERTY/AZERTY. Une disposition Bépo, Dvorak
+            # ou Colemak place une autre lettre ici : limitation connue, documentée.
+            V_KEYCODE = 9
+            down = CGEventCreateKeyboardEvent(src, V_KEYCODE, True)
             CGEventSetFlags(down, kCGEventFlagMaskCommand)
-            up = CGEventCreateKeyboardEvent(None, V_KEYCODE, False)
+            up = CGEventCreateKeyboardEvent(src, V_KEYCODE, False)
             CGEventSetFlags(up, kCGEventFlagMaskCommand)
             CGEventPost(kCGHIDEventTap, down)
+            time.sleep(0.01)   # certaines apps ratent un appui/relâchement trop serré
             CGEventPost(kCGHIDEventTap, up)
         except Exception as e:
             log(f"Cmd+V : {e}")
