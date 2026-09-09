@@ -1,5 +1,33 @@
 # Journal des versions — VoixFlash
 
+## 1.5.0 — la dictée sait se faire comprendre
+
+- **Retour sonore.** Un son quand la capture démarre, un autre quand elle s'arrête, un
+  troisième quand une dictée est abandonnée. Le son de départ est joué **au premier son
+  réellement capté**, pas au moment où l'on croit avoir ouvert le micro : c'est le seul
+  instant où « tu peux parler » est vrai. Désactivable dans le menu. Aucun son n'est joué
+  quand le micro est un casque Bluetooth, pour ne pas le faire basculer en mode téléphone.
+- **La fin des phrases n'est plus coupée.** L'enregistrement continue deux dixièmes de
+  seconde après le relâchement de la touche : le dernier mot est encore dans les tampons du
+  système au moment où l'on relâche, et il était tranché.
+- **Les appuis involontaires ne produisent plus rien.** Un effleurement de la touche de
+  dictée (moins de 0,3 s) est jeté au lieu de transcrire du bruit. La règle ne s'applique
+  qu'aux touches modificatrices comme Option : sur une touche ordinaire, on peut relâcher
+  aussitôt et continuer à parler.
+- **Échap annule la dictée en cours.** Rien n'est transcrit ni collé, et le micro est libéré
+  par le même chemin qu'un arrêt normal.
+- **Les raccourcis clavier redeviennent des raccourcis.** Avec Option comme touche de dictée,
+  taper Option+A lançait une dictée parasite qui collait du bruit. L'arrivée d'une touche
+  ordinaire pendant le maintien annule désormais la capture.
+- **L'icône ne reste plus bloquée.** Si la libération du micro échouait pendant une
+  annulation, l'indicateur restait figé sur « enregistrement » alors que l'app ne faisait
+  plus rien.
+
+> Mesuré sur cette machine : le micro délivre son premier son 94 ms après l'ouverture. La
+> préparation du micro à l'avance, envisagée après l'étude des outils concurrents (qui
+> mesuraient 500 à 660 ms), n'aurait fait gagner que 36 ms : elle a été écartée plutôt que
+> d'allumer en permanence l'indicateur micro de macOS.
+
 ## 1.4.0 — vocabulaire et collage sûr
 
 - **Vocabulaire personnalisé.** Nouveau menu « Texte dicté ». Tu y ajoutes les mots dont

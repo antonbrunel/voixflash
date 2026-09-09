@@ -51,8 +51,13 @@ Le plus simple : clique sur l'icône VoixFlash dans la barre des menus ›
 
 ### Dictée éclair (partout)
 1. Place le curseur dans n'importe quel champ de texte (mail, navigateur, note…).
-2. **Maintiens la touche de dictée** (par défaut **Option droite**), parle, puis **relâche**.
-3. Le texte s'écrit tout seul à l'endroit du curseur.
+2. **Maintiens la touche de dictée** (par défaut **Option droite**). Un petit son confirme que
+   le micro écoute : **attends-le pour parler**, c'est ce qui évite de perdre le premier mot.
+3. Parle, puis **relâche**. Un second son marque la fin de la capture.
+4. Le texte s'écrit tout seul à l'endroit du curseur.
+
+> **Échap** pendant que tu parles annule la dictée : rien n'est écrit. Un simple effleurement
+> de la touche ne dicte rien non plus.
 
 ### Réunion / enregistrement long
 1. Clique l'icône VoixFlash › **« Démarrer une réunion »**.

@@ -91,7 +91,8 @@ Puis clique **« Redémarrer VoixFlash »**.
 
 ## 🗣️ Utilisation
 
-- **Dictée éclair** : maintiens la touche (par défaut **Option droite**), parle, relâche.
+- **Dictée éclair** : maintiens la touche (par défaut **Option droite**), attends le petit son
+  qui confirme que le micro écoute, parle, relâche. **Échap** annule la dictée en cours.
 - **Réunion** : icône › **« Démarrer une réunion »** … **« Arrêter la réunion »**.
 - **Importer un fichier audio** : icône › **Réunions › « Importer un fichier audio… »** →
   choisis un fichier audio ou vidéo. La langue est détectée automatiquement, la progression

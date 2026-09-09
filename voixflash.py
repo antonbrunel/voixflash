@@ -92,7 +92,7 @@ except Exception:
 #  Chemins & constantes
 # --------------------------------------------------------------------------- #
 APP_NAME = "VoixFlash"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 LAUNCHD_LABEL = "com.voixflash.agent"   # étiquette du LaunchAgent (cf. install.command)
 APP_HOME = os.path.expanduser(f"~/Library/Application Support/{APP_NAME}")
 CONFIG_PATH = os.path.join(APP_HOME, "config.json")
@@ -186,7 +186,15 @@ DEFAULT_CONFIG = {
     "diarization_enabled": False,  # séparer les locuteurs en réunion (« Locuteur 1 : … »)
     "diarization_speakers": 0,   # nb de locuteurs attendus (0 = détection automatique)
     "remove_hesitations": True,  # retirer les « euh », « hmm » du texte transcrit
+    "sounds_enabled": True,      # petits sons au début et à la fin d'une dictée
 }
+
+# Traîne conservée après le relâchement de la touche. Le dernier mot est encore en
+# vol dans les tampons de CoreAudio au moment du relâchement : couper net le tronque.
+RELEASE_TAIL_S = 0.2
+# En deçà, l'appui n'est pas une dictée (touche effleurée). Cf. _on_release : la règle
+# ne vaut QUE pour une touche modificatrice.
+SHORT_TAP_S = 0.3
 
 # Amorce de style passée à Whisper : ce n'est PAS du vocabulaire, mais une phrase
 # correctement ponctuée et accentuée dans la langue visée. Le modèle poursuit dans
@@ -458,6 +466,88 @@ def edit_distance(a, b, cap):
             return cap + 1
         prev = cur
     return prev[-1]
+
+
+# ------------------------------------------------------------ retours sonores --
+# Sans retour sonore, on ne sait pas si la touche a bien été prise, on parle trop
+# tôt, et le début de la phrase est perdu. C'est la panne la plus courante d'une
+# dictée en maintien de touche, et elle ne se voit pas : la transcription est
+# simplement incomplète.
+
+MODIFIER_KEYS = frozenset(name for name in (
+    "alt", "alt_l", "alt_r", "alt_gr", "cmd", "cmd_l", "cmd_r",
+    "ctrl", "ctrl_l", "ctrl_r", "shift", "shift_l", "shift_r")
+    if hasattr(keyboard.Key, name))
+
+
+def hotkey_is_modifier(key):
+    """True si la touche de dictée est un simple modificateur (Option, Cmd…).
+
+    Ces touches n'écrivent rien, donc on peut les maintenir en sécurité dans un
+    document. En contrepartie, elles se combinent avec d'autres : c'est le seul
+    cas où un appui très court, ou l'arrivée d'une autre touche, doit annuler."""
+    try:
+        return isinstance(key, keyboard.Key) and key.name in MODIFIER_KEYS
+    except Exception:
+        return False
+
+
+def input_is_bluetooth():
+    """True si l'entrée audio courante ressemble à un périphérique Bluetooth.
+
+    Ouvrir une entrée ET une sortie en même temps sur un casque Bluetooth force
+    macOS à basculer en profil « mains libres » : le son devient téléphonique et
+    les écouteurs peuvent être arrachés à l'appareil qui les utilisait. On évite
+    donc de jouer un son quand le micro Bluetooth est ouvert."""
+    try:
+        name = str(sd.query_devices(kind="input").get("name", "")).lower()
+    except Exception:
+        return False
+    return any(m in name for m in ("airpods", "bluetooth", "hands-free", "headset", "beats"))
+
+
+class Sounds:
+    """Retours sonores, lecteurs préparés une fois pour toutes.
+
+    Instancier le lecteur au moment du déclenchement coûterait plus cher que le
+    son lui-même et retarderait le retour, qui n'a d'intérêt que s'il est immédiat.
+    Passer par `afplay` en sous-processus serait pire encore (environ 100 ms rien
+    que pour lancer le programme)."""
+
+    NAMES = {"start": "Tink", "stop": "Pop", "error": "Basso"}
+
+    def __init__(self, volume=0.3):
+        self._players = {}
+        self._ui_sounds_on = True
+        try:
+            from AppKit import NSSound, NSUserDefaults
+            for key, name in self.NAMES.items():
+                player = NSSound.soundNamed_(name)
+                if player is not None:
+                    player.setVolume_(volume)
+                    self._players[key] = player
+            # Respecte « Émettre les effets sonores de l'interface » des réglages macOS.
+            domain = NSUserDefaults.standardUserDefaults().persistentDomainForName_(
+                "Apple Global Domain") or {}
+            value = domain.get("com.apple.sound.uiaudio.enabled")
+            if value is not None:
+                self._ui_sounds_on = bool(value)
+        except Exception as e:
+            log(f"retours sonores indisponibles : {e}")
+
+    def play(self, which):
+        """Joue un retour. Ne lève jamais : un son raté ne doit rien casser."""
+        if not self._ui_sounds_on:
+            return
+        player = self._players.get(which)
+        if player is None:
+            return
+        try:
+            if player.isPlaying():
+                player.stop()
+            player.play()
+        except Exception as e:
+            log(f"lecture du son « {which} » : {e}")
 
 
 def fail_open(step):
@@ -1294,7 +1384,9 @@ class VoixFlashApp(rumps.App):
         self._transcribe_cancel = False   # demande d'annulation de la transcription de réunion
         self._record_mode = None          # "flash" ou "meeting"
         self._ptt_active = False          # touche de dictée actuellement maintenue ?
+        self._ptt_started = None          # instant d'appui (mesure des appuis trop brefs)
         self._capturing = False           # en train de capturer une nouvelle touche ?
+        self._sounds = Sounds()           # lecteurs préparés une fois pour toutes
         self._captured = None             # dernière touche captée pendant la capture
         self._stream = None               # flux audio en cours
         self._frames = []                 # morceaux audio enregistrés
@@ -1384,6 +1476,8 @@ class VoixFlashApp(rumps.App):
         self.text_menu = rumps.MenuItem("Texte dicté")
         self.hesit_item = rumps.MenuItem("Retirer les hésitations (euh, hmm)",
                                          callback=self.toggle_hesitations)
+        self.sound_item = rumps.MenuItem("Retour sonore (début et fin de dictée)",
+                                         callback=self.toggle_sounds)
         self.help_menu = rumps.MenuItem("Aide & autorisations")
 
         self.menu = [
@@ -1396,6 +1490,7 @@ class VoixFlashApp(rumps.App):
             self.lang_menu,
             self.text_menu,
             self.hotkey_menu,
+            self.sound_item,
             self.restore_item,
             rumps.separator,
             self.help_menu,
@@ -1442,6 +1537,7 @@ class VoixFlashApp(rumps.App):
         self.ts_item.state = bool(self.config["meeting_timestamps"])
         self.restore_item.state = bool(self.config["restore_clipboard"])
         self.hesit_item.state = bool(self.config.get("remove_hesitations", True))
+        self.sound_item.state = bool(self.config.get("sounds_enabled", True))
 
         # Sous-menu d'aide : guide complet en tête, puis liens vers les réglages macOS.
         self.help_menu.add(rumps.MenuItem("Mode d'emploi complet", callback=self.show_guide))
@@ -1880,8 +1976,18 @@ class VoixFlashApp(rumps.App):
             if self._capturing:
                 self._captured = key
                 return
-            # On ignore la répétition automatique tant que la touche reste maintenue.
             if self._ptt_active:
+                if key_matches(key, self._hotkey):
+                    return        # répétition automatique de la touche maintenue
+                # Une AUTRE touche arrive pendant le maintien.
+                if key == keyboard.Key.esc:
+                    self._cancel_recording("annulée (Échap)")
+                    return
+                # Avec un modificateur comme touche de dictée, « Option + A » n'est pas
+                # une dictée : c'est un raccourci que l'utilisateur voulait taper. On
+                # jette la capture au lieu de coller le bruit qui l'accompagne.
+                if hotkey_is_modifier(self._hotkey) and not hotkey_is_modifier(key):
+                    self._cancel_recording("annulée (accord de touches)")
                 return
             if not key_matches(key, self._hotkey):
                 return
@@ -1894,6 +2000,7 @@ class VoixFlashApp(rumps.App):
                 self._ui_queue.put(("error", "Le moteur de transcription se charge encore, réessaie dans un instant."))
                 return
             self._ptt_active = True
+            self._ptt_started = time.monotonic()
             self._start_recording("flash")
         except Exception as e:
             log(f"_on_press : {e}")
@@ -1908,6 +2015,16 @@ class VoixFlashApp(rumps.App):
             if not key_matches(key, self._hotkey):
                 return
             self._ptt_active = False
+            held = time.monotonic() - (self._ptt_started or 0.0)
+            # Appui trop bref pour être une dictée : on jette. Réservé aux touches
+            # MODIFICATRICES, qu'on effleure souvent sans intention. Appliquée à une
+            # touche ordinaire, cette règle jetterait de vraies dictées : l'utilisateur
+            # peut relâcher la touche aussitôt et continuer à parler.
+            if hotkey_is_modifier(self._hotkey) and held < SHORT_TAP_S:
+                self._cancel_recording(f"ignorée (appui de {held * 1000:.0f} ms)")
+                return
+            if self.config.get("sounds_enabled", True):
+                self._sounds.play("stop")
             self._stop_recording()
         except Exception as e:
             log(f"_on_release : {e}")
@@ -1985,25 +2102,44 @@ class VoixFlashApp(rumps.App):
                 pass
 
     # ------------------------------------------------------------ audio I/O --
-    def _make_audio_cb(self, sink, disk_queue):
+    def _make_audio_cb(self, sink, disk_queue, ready=None):
         """Fabrique le callback audio d'UN flux précis.
 
         Le callback écrit dans la liste `sink` qui lui est propre, et non dans
         self._frames : si un ancien flux n'est pas encore complètement arrêté quand un
         nouvel enregistrement démarre, ses derniers blocs ne peuvent plus polluer le
-        nouvel enregistrement."""
+        nouvel enregistrement.
+
+        `ready` est armé au tout PREMIER bloc reçu. Le retour de `start()` ne prouve
+        rien : le matériel peut mettre plusieurs centaines de millisecondes à délivrer
+        du son. Ce n'est qu'à ce moment-là qu'il est honnête de dire « parle »."""
         def cb(indata, _frames, _time_info, status):
             if status:
                 log(f"audio status: {status}")
             # Copie nécessaire : le tampon est réutilisé par PortAudio.
             buf = indata.copy()
             sink.append(buf)
+            if ready is not None and not ready.is_set():
+                ready.set()       # simple drapeau : rien de coûteux ici
             if disk_queue is not None:
                 try:
                     disk_queue.put_nowait(buf.tobytes())
                 except Exception:
                     pass          # jamais d'exception dans un callback temps réel
         return cb
+
+    def _announce_ready(self, ready):
+        """Joue le son de départ au premier bloc audio réellement capté.
+
+        Sur un micro Bluetooth on se tait : ouvrir une sortie audio pendant que
+        l'entrée est ouverte ferait basculer le casque en profil « mains libres »
+        (cf. input_is_bluetooth)."""
+        if not ready.wait(timeout=2.0):
+            log("aucun bloc audio reçu dans les 2 s : micro muet ou occupé ?")
+            return
+        if input_is_bluetooth():
+            return
+        self._sounds.play("start")
 
     def _start_recording(self, mode):
         """Démarre l'enregistrement. Renvoie True si le micro s'est bien ouvert."""
@@ -2027,10 +2163,13 @@ class VoixFlashApp(rumps.App):
         if mode == "meeting":
             self._start_disk_backup(16000)
             disk_q = self._disk_queue
+        ready = threading.Event()
+        if self.config.get("sounds_enabled", True):
+            threading.Thread(target=self._announce_ready, args=(ready,), daemon=True).start()
         try:
             self._record_sr = 16000
             self._stream = sd.InputStream(samplerate=16000, channels=1, dtype="int16",
-                                          callback=self._make_audio_cb(frames, disk_q))
+                                          callback=self._make_audio_cb(frames, disk_q, ready))
             self._stream.start()
             log(f"Enregistrement démarré ({mode}, 16000 Hz).")
             return True
@@ -2060,7 +2199,7 @@ class VoixFlashApp(rumps.App):
             try:
                 self._stream = sd.InputStream(
                     samplerate=self._record_sr, channels=1, dtype="int16",
-                    callback=self._make_audio_cb(frames, disk_q))
+                    callback=self._make_audio_cb(frames, disk_q, ready))
                 self._stream.start()
                 log(f"Enregistrement démarré ({mode}, {self._record_sr} Hz, repli).")
                 return True
@@ -2112,10 +2251,60 @@ class VoixFlashApp(rumps.App):
         threading.Thread(target=self._finalize_recording,
                          args=(stream, frames, record_sr, mode), daemon=True).start()
 
+    def _cancel_recording(self, reason):
+        """Abandonne l'enregistrement en cours SANS transcrire (thread de fond).
+
+        Sert aux appuis involontaires : touche relâchée aussitôt, accord de touches,
+        ou Échap. On libère le micro par le MÊME chemin qu'un arrêt normal, sinon
+        l'indicateur d'enregistrement de macOS resterait allumé indéfiniment."""
+        # Remis à zéro AVANT toute sortie anticipée : si l'ouverture du micro avait
+        # échoué, l'état « touche maintenue » resterait sinon coincé à vrai et plus
+        # aucune dictée ne démarrerait.
+        self._ptt_active = False
+        with self._lock:
+            if not self._recording:
+                return
+            self._recording = False
+            self._record_mode = None
+            self._record_start = None
+            stream = self._stream
+            self._stream = None
+            frames = self._frames
+            self._frames = []
+        log(f"Dictée {reason}.")
+
+        def _teardown():
+            # Quoi qu'il arrive pendant la libération, l'indicateur DOIT repasser au
+            # repos : sinon l'icône reste figée sur « enregistrement » et l'app paraît
+            # bloquée alors qu'elle ne fait plus rien.
+            try:
+                try:
+                    if stream is not None:
+                        stream.stop()
+                        stream.close()
+                except Exception as e:
+                    log(f"fermeture flux (annulation) : {e}")
+                self._discard_disk_backup(self._stop_disk_backup())
+                frames.clear()
+                if self.config.get("sounds_enabled", True):
+                    self._sounds.play("error")
+            except Exception as e:
+                log(f"annulation de la dictée : {e}")
+            finally:
+                self._ui_queue.put(("state", "idle"))
+
+        threading.Thread(target=_teardown, daemon=True).start()
+
     def _finalize_recording(self, stream, frames, record_sr, mode):
         """Ferme le flux, assemble l'audio, puis lance la transcription. Thread de fond."""
         try:
             t0 = time.monotonic()
+            # Traîne de fin : on laisse le flux tourner un court instant avant de le
+            # fermer. Couper à l'instant exact du relâchement tranche le dernier mot,
+            # qui est encore en vol dans les tampons de CoreAudio. Le callback continue
+            # d'alimenter la MÊME liste, donc ces derniers blocs sont bien récupérés.
+            if mode == "flash":
+                time.sleep(RELEASE_TAIL_S)
             if stream is not None:
                 try:
                     stream.stop()    # attend la fin des callbacks (plus aucun ajout)
@@ -3204,6 +3393,13 @@ class VoixFlashApp(rumps.App):
         sender.state = self.config["remove_hesitations"]
         save_json(CONFIG_PATH, self.config)
 
+    def toggle_sounds(self, sender):
+        self.config["sounds_enabled"] = not self.config.get("sounds_enabled", True)
+        sender.state = self.config["sounds_enabled"]
+        save_json(CONFIG_PATH, self.config)
+        if self.config["sounds_enabled"]:
+            self._sounds.play("start")   # aperçu immédiat du son choisi
+
     def _vocab_prompt(self, title, message, placeholder=""):
         """Petite fenêtre de saisie. Renvoie le texte saisi, ou None si annulé."""
         try:
@@ -3616,6 +3812,7 @@ class VoixFlashApp(rumps.App):
             self.config.get("language", "fr"), "Français")
         ts_state = "activé" if self.config.get("meeting_timestamps") else "désactivé"
         hesit_state = "activé" if self.config.get("remove_hesitations", True) else "désactivé"
+        sound_state = "activé" if self.config.get("sounds_enabled", True) else "désactivé"
 
         guide = (
             f"VOIXFLASH {APP_VERSION} — MODE D'EMPLOI COMPLET\n"
@@ -3628,6 +3825,11 @@ class VoixFlashApp(rumps.App):
             "  Le texte s'écrit tout seul à l'endroit du curseur.\n"
             "  (Maintien = on parle ; relâché = ça écrit. Une pression très brève\n"
             "  ne dicte rien.)\n"
+            "  Un petit son confirme que le micro écoute : attends-le pour parler.\n"
+            "  Un autre son marque la fin de la capture.\n"
+            "  ÉCHAP pendant que tu parles annule la dictée : rien n'est écrit.\n"
+            "  L'enregistrement continue un court instant après le relâchement, pour\n"
+            "  ne pas couper ton dernier mot.\n"
             "\n"
             "• RÉUNION (enregistrement long)\n"
             "  Menu › « Démarrer une réunion ». Parle aussi longtemps que tu veux.\n"
@@ -3770,6 +3972,11 @@ class VoixFlashApp(rumps.App):
             "  Toute modification prend effet à la dictée suivante, sans redémarrage.\n"
             f"• Texte dicté › Retirer les hésitations : efface les « euh » et « hmm ».\n"
             f"  Actuel : {hesit_state}.\n"
+            f"• Retour sonore : un son au début et à la fin de chaque dictée, pour savoir\n"
+            f"  sans regarder l'écran que le micro écoute. Actuel : {sound_state}.\n"
+            "  Le son de départ arrive quand le micro capte VRAIMENT : attends-le avant\n"
+            "  de parler, c'est ce qui évite de perdre le premier mot. Rien n'est joué\n"
+            "  sur un casque Bluetooth (cela le ferait passer en qualité téléphone).\n"
             "\n"
             "━━━ 7. AUTORISATIONS (à faire une seule fois) ━━━\n"
             "\n"
