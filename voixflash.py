@@ -288,6 +288,48 @@ def log(msg):
         pass
 
 
+# --------------------------------------------------- journal de diagnostic audio --
+# Fichier distinct du journal général, en clé=valeur, pour répondre à UNE question :
+# « le micro a-t-il vraiment délivré du son, et quand ». La quasi-totalité des
+# diagnostics de cause racine sur ce genre d'outil vient d'un journal, pas d'une
+# reproduction sur la machine du développeur.
+#
+# Deux règles tenues strictement :
+#   • aucune transcription, aucun extrait de texte, jamais. Un outil qui se vend sur
+#     la confidentialité ne journalise pas ce qu'on lui dicte.
+#   • on ne journalise que ce qu'on a MESURÉ, jamais un drapeau interne présenté comme
+#     une vérité d'état. Une ligne qui affiche ce que l'application croit, au lieu de
+#     ce que le moteur audio fait, rend un défaut invisible pendant des mois.
+DIAG_PATH = os.path.join(APP_HOME, "diagnostic.log")
+DIAG_KEEP_DAYS = 7
+DIAG_MAX_BYTES = 2 << 20
+
+
+def diag(event, **fields):
+    """Écrit une ligne d'événement audio. Ne lève jamais, n'écrit jamais de texte dicté."""
+    try:
+        parts = [datetime.datetime.now().isoformat(timespec="milliseconds"), event]
+        for key, value in fields.items():
+            parts.append(f"{key}={value}")
+        with open(DIAG_PATH, "a", encoding="utf-8") as f:
+            f.write(" ".join(str(p) for p in parts) + "\n")
+    except Exception:
+        pass
+
+
+def diag_rotate():
+    """Fenêtre glissante : on repart d'un fichier neuf au-delà de la taille ou de l'âge."""
+    try:
+        if not os.path.exists(DIAG_PATH):
+            return
+        too_big = os.path.getsize(DIAG_PATH) > DIAG_MAX_BYTES
+        too_old = (time.time() - os.path.getmtime(DIAG_PATH)) > DIAG_KEEP_DAYS * 86400
+        if too_big or too_old:
+            os.replace(DIAG_PATH, DIAG_PATH + ".1")
+    except Exception:
+        pass
+
+
 def load_json(path, default):
     """Lit un fichier JSON ; renvoie `default` s'il est absent ou illisible."""
     try:
@@ -1752,6 +1794,7 @@ class VoixFlashApp(rumps.App):
         self._need_rearm = False          # réarmement de l'écoute à faire dès que possible
         self._captured = None             # dernière touche captée pendant la capture
         self._stream = None               # flux audio en cours
+        self._audio_stats = None          # compteurs livrés par le moteur audio
         self._frames = []                 # morceaux audio enregistrés
         self._record_sr = 16000           # fréquence d'échantillonnage utilisée
         self._record_start = None         # début de l'enregistrement (garde-fou durée)
@@ -1818,6 +1861,9 @@ class VoixFlashApp(rumps.App):
             self._ui_queue.put(("recover_meeting", interrupted))
 
         log(f"{APP_NAME} {APP_VERSION} démarré (modèle demandé : {self._requested_model}).")
+        diag_rotate()
+        diag("demarrage", version=APP_VERSION, modele=self._requested_model,
+             langue=self.config.get("language"))
 
     # ----------------------------------------------------------------- menu --
     def _build_menu(self):
@@ -1917,6 +1963,8 @@ class VoixFlashApp(rumps.App):
         self.help_menu.add(rumps.MenuItem("Mode d'emploi complet", callback=self.show_guide))
         self.help_menu.add(rumps.MenuItem("La touche de dictée ne répond plus ?",
                                           callback=self.diagnose_hotkey))
+        self.help_menu.add(rumps.MenuItem("Copier les informations système",
+                                          callback=self.copy_system_info))
         self.help_menu.add(rumps.MenuItem("Voir le chemin à autoriser", callback=self.show_path))
         self.help_menu.add(rumps.MenuItem("Ouvrir réglages › Microphone", callback=self.open_mic_settings))
         self.help_menu.add(rumps.MenuItem("Ouvrir réglages › Accessibilité", callback=self.open_acc_settings))
@@ -2655,7 +2703,7 @@ class VoixFlashApp(rumps.App):
                 pass
 
     # ------------------------------------------------------------ audio I/O --
-    def _make_audio_cb(self, sink, disk_queue, ready=None, channels=1):
+    def _make_audio_cb(self, sink, disk_queue, ready=None, channels=1, stats=None):
         """Fabrique le callback audio d'UN flux précis.
 
         Le callback écrit dans la liste `sink` qui lui est propre, et non dans
@@ -2678,6 +2726,15 @@ class VoixFlashApp(rumps.App):
                 # Copie nécessaire : le tampon est réutilisé par PortAudio.
                 buf = indata.copy()
             sink.append(buf)
+            if stats is not None:
+                # On COMPTE, on n'écrit pas : une écriture disque depuis un thread
+                # temps réel creuse des trous dans l'enregistrement. Le journal de
+                # diagnostic lit ces compteurs depuis un autre thread.
+                stats["blocs"] += 1
+                if not buf.any():
+                    stats["nuls"] += 1
+                if stats["premier"] is None:
+                    stats["premier"] = time.monotonic()
             if ready is not None and not ready.is_set():
                 ready.set()       # simple drapeau : rien de coûteux ici
             if disk_queue is not None:
@@ -2687,6 +2744,21 @@ class VoixFlashApp(rumps.App):
                     pass          # jamais d'exception dans un callback temps réel
         return cb
 
+    def _diag_close(self, mode, motif="fin"):
+        """Résumé d'une capture, à partir de ce que le moteur audio a RÉELLEMENT livré.
+
+        `nuls` est le compte de blocs strictement vides : c'est la seule ligne qui
+        distingue « personne n'a parlé » de « la route audio était morte »."""
+        stats = self._audio_stats
+        self._audio_stats = None
+        if not stats:
+            return
+        diag("micro_ferme", mode=mode, motif=motif,
+             blocs=stats["blocs"], nuls=stats["nuls"],
+             secondes=round(time.monotonic() - stats["t0"], 1),
+             premier_ms=(round((stats["premier"] - stats["t0"]) * 1000)
+                         if stats["premier"] else "aucun"))
+
     def _announce_ready(self, ready):
         """Joue le son de départ au premier bloc audio réellement capté.
 
@@ -2695,6 +2767,13 @@ class VoixFlashApp(rumps.App):
         (cf. input_is_bluetooth)."""
         if not ready.wait(timeout=2.0):
             log("aucun bloc audio reçu dans les 2 s : micro muet ou occupé ?")
+            diag("premier_bloc", recu="non", attente_ms=2000)
+            return
+        stats = self._audio_stats
+        if stats and stats.get("premier"):
+            diag("premier_bloc", recu="oui",
+                 delai_ms=round((stats["premier"] - stats["t0"]) * 1000))
+        if not self.config.get("sounds_enabled", True):
             return
         if input_is_bluetooth():
             return
@@ -2723,8 +2802,15 @@ class VoixFlashApp(rumps.App):
             self._start_disk_backup(16000)
             disk_q = self._disk_queue
         ready = threading.Event()
-        if self.config.get("sounds_enabled", True):
-            threading.Thread(target=self._announce_ready, args=(ready,), daemon=True).start()
+        # Compteurs ALIMENTÉS PAR LE MOTEUR AUDIO lui-même, pas par ce que l'application
+        # croit être en train de faire. C'est toute la valeur du journal de diagnostic.
+        stats = {"blocs": 0, "nuls": 0, "premier": None,
+                 "t0": time.monotonic(), "battement": time.monotonic()}
+        self._audio_stats = stats
+        diag_rotate()
+        # Toujours lancé, même sans retour sonore : c'est aussi lui qui mesure le délai
+        # du premier bloc réellement capté pour le journal de diagnostic.
+        threading.Thread(target=self._announce_ready, args=(ready,), daemon=True).start()
         # Combinaisons essayées dans l'ordre. 16 kHz d'abord (CoreAudio convertit
         # proprement et on évite tout rééchantillonnage) ; puis la fréquence native du
         # micro ; puis le mono, au cas où c'est l'ouverture à deux canaux qui gêne le
@@ -2750,8 +2836,12 @@ class VoixFlashApp(rumps.App):
                 self._record_sr = sr
                 self._stream = sd.InputStream(
                     samplerate=sr, channels=nch, dtype="int16",
-                    callback=self._make_audio_cb(frames, disk_q, ready, channels=nch))
+                    callback=self._make_audio_cb(frames, disk_q, ready,
+                                                 channels=nch, stats=stats))
                 self._stream.start()
+                diag("micro_ouvert", mode=mode, hz=sr, canaux=nch,
+                     transport=("bluetooth" if input_is_bluetooth() else "filaire"),
+                     essai=ordered.index((sr, nch)) + 1)
                 # La sauvegarde disque a été ouverte en annonçant 16 kHz : on corrige la
                 # fiche, sinon une réunion récupérée serait relue à la mauvaise vitesse.
                 if sr != 16000 and self._disk_paths is not None:
@@ -2775,6 +2865,8 @@ class VoixFlashApp(rumps.App):
                     self._stream = None
 
         log(f"Impossible d'ouvrir le micro : {last_error}")
+        diag("micro_echec", mode=mode, essais=len(ordered))
+        self._audio_stats = None
         self._discard_disk_backup(self._stop_disk_backup())
         with self._lock:
             self._recording = False
@@ -2855,6 +2947,7 @@ class VoixFlashApp(rumps.App):
                 except Exception as e:
                     log(f"fermeture flux (annulation) : {e}")
                 self._discard_disk_backup(self._stop_disk_backup())
+                self._diag_close("flash", motif="annulee")
                 frames.clear()
                 if self.config.get("sounds_enabled", True):
                     self._sounds.play("error")
@@ -2882,6 +2975,7 @@ class VoixFlashApp(rumps.App):
                 except Exception as e:
                     log(f"fermeture flux : {e}")
             backup = self._stop_disk_backup()
+            self._diag_close(mode)
             audio = self._frames_to_float32(frames)
             log(f"Enregistrement arrêté ({mode}) : {len(audio) / max(1, record_sr):.1f} s "
                 f"d'audio, flux fermé en {time.monotonic() - t0:.1f} s.")
@@ -3582,6 +3676,20 @@ class VoixFlashApp(rumps.App):
         try:
             if self._need_rearm and not self._recording and not self._ptt_active:
                 self._rearm_listener("réveil différé")
+        except Exception:
+            pass
+        # 1 ter) Battement du journal audio pendant une capture longue. Sur une réunion
+        #        d'une heure, c'est la seule trace qui dit si le micro a continué de
+        #        livrer du son ou s'il s'est tu en cours de route. Écrit depuis CE
+        #        thread, jamais depuis le callback audio.
+        try:
+            stats = self._audio_stats
+            if stats and self._recording:
+                now = time.monotonic()
+                if now - stats["battement"] >= 30.0:
+                    stats["battement"] = now
+                    diag("battement", blocs=stats["blocs"], nuls=stats["nuls"],
+                         secondes=round(now - stats["t0"], 1))
         except Exception:
             pass
         # 2) Arrêter un enregistrement anormalement long (micro oublié, mémoire).
@@ -4750,6 +4858,82 @@ class VoixFlashApp(rumps.App):
         if not secure and acc:
             self._rearm_listener("diagnostic manuel")
         self._show_info("Diagnostic de la touche de dictée", "\n".join(lignes))
+
+    def copy_system_info(self, _sender):
+        """Copie un bloc de diagnostic prêt à coller dans un message d'aide.
+
+        Sans lui, tout signalement commence par une demi-douzaine d'allers-retours pour
+        établir la version de macOS, le micro utilisé et l'état des autorisations. Rien
+        de personnel n'y figure : ni texte dicté, ni vocabulaire, ni historique."""
+        lignes = [f"{APP_NAME} {APP_VERSION}"]
+        try:
+            uname = os.uname()
+            lignes.append(f"macOS : {uname.release} ({uname.machine})")
+        except Exception:
+            pass
+        try:
+            marque = subprocess.run(["/usr/sbin/sysctl", "-n", "machdep.cpu.brand_string"],
+                                    capture_output=True, text=True, timeout=5).stdout.strip()
+            lignes.append(f"Processeur : {marque} ({os.cpu_count()} coeurs, "
+                          f"{CPU_THREADS} utilisés)")
+        except Exception:
+            pass
+        lignes.append(f"Python : {sys.version.split()[0]}")
+        lignes.append("")
+        # Entrées audio : on nomme les périphériques, ce qui est nécessaire pour
+        # diagnostiquer un canal muet ou un périphérique virtuel d'appel en cours.
+        try:
+            defaut = sd.query_devices(kind="input")
+            lignes.append(f"Entrée par défaut : {defaut.get('name')} "
+                          f"({int(defaut.get('max_input_channels', 0))} canaux, "
+                          f"{int(defaut.get('default_samplerate', 0))} Hz)")
+            autres = [d.get("name") for d in sd.query_devices()
+                      if d.get("max_input_channels", 0) > 0]
+            lignes.append(f"Entrées disponibles : {', '.join(autres) or 'aucune'}")
+            lignes.append(f"Transport : {'Bluetooth' if input_is_bluetooth() else 'filaire'}")
+        except Exception as e:
+            lignes.append(f"Entrées audio : illisibles ({e})")
+        lignes.append("")
+        secure = secure_input_enabled()
+        lignes += [
+            f"Modèle : {self.config.get('model')} "
+            f"(chargé : {self.model_name_loaded or 'aucun'})",
+            f"Langue : {self.config.get('language')}",
+            f"Touche : {self._current_hotkey_label()} "
+            f"({'modificateur' if hotkey_is_modifier(self._hotkey) else 'touche ordinaire'})",
+            f"Mains libres : {'oui' if self.config.get('handsfree_enabled') else 'non'}",
+            f"Restauration du presse-papiers : "
+            f"{'oui' if self.config.get('restore_clipboard', True) else 'non'}",
+            f"Séparation des locuteurs : "
+            f"{'oui' if self.config.get('diarization_enabled') else 'non'}"
+            f" (plafond {self.config.get('diarization_speakers') or 'aucun'},"
+            f" module {'présent' if diarization_models_present() else 'absent'})",
+            "",
+            f"Accessibilité : {'accordée' if accessibility_trusted() else 'MANQUANTE'}",
+            f"Écoute clavier vivante : "
+            f"{'oui' if (self._listener is not None and self._listener.is_alive()) else 'NON'}",
+            f"Saisie sécurisée : "
+            f"{'inconnue' if secure is None else ('OUI' if secure else 'non')}",
+            f"Diarisation importable : {'oui' if _load_sherpa() is not None else 'non'}",
+            f"Recherche plein texte (FTS5) : {'oui' if _FTS_AVAILABLE else 'non'}",
+        ]
+        # Dernières lignes du journal audio : c'est ce qui distingue un micro muet d'un
+        # silence normal, et c'est mesuré, pas déduit d'un drapeau interne.
+        try:
+            with open(DIAG_PATH, "r", encoding="utf-8") as f:
+                dernieres = f.readlines()[-12:]
+            if dernieres:
+                lignes += ["", "Journal audio (12 dernières lignes) :"]
+                lignes += [l.rstrip() for l in dernieres]
+        except Exception:
+            pass
+        bloc = "\n".join(lignes)
+        self._set_clipboard(bloc)
+        self._show_info(
+            "Informations copiées",
+            "Le bloc de diagnostic est dans ton presse-papiers : colle-le dans ton "
+            "message.\n\nIl ne contient AUCUN texte dicté, aucun vocabulaire et aucun "
+            "historique.\n\n" + bloc[:900] + ("…" if len(bloc) > 900 else ""))
 
     def show_path(self, _sender):
         # On affiche le chemin STABLE du lanceur (celui que launchd utilise), pas le

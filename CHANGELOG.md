@@ -55,6 +55,19 @@
 - **Un seul moteur en mémoire à la fois.** Changer de qualité construisait le nouveau
   moteur avant de libérer l'ancien : les deux coexistaient le temps du chargement.
 
+- **Journal de diagnostic audio**, dans un fichier à part. Il répond à une seule
+  question : le micro a-t-il vraiment délivré du son, et quand. Chaque capture y laisse
+  l'ouverture du périphérique, le délai du premier bloc réellement reçu, un battement
+  toutes les 30 secondes pendant une réunion, et un résumé de fermeture avec le nombre
+  de blocs reçus et le nombre de blocs strictement vides. Ce dernier chiffre est le seul
+  qui distingue « personne n'a parlé » de « la route audio était morte ». Aucun texte
+  dicté n'y figure, jamais, et rien n'y est écrit depuis le fil temps réel du micro.
+  Fenêtre de sept jours.
+- **« Aide & autorisations › Copier les informations système »** produit un bloc prêt à
+  coller dans un message : version, macOS, matériel, entrées audio disponibles, réglages,
+  état des autorisations et douze dernières lignes du journal audio. Sans texte dicté,
+  sans vocabulaire, sans historique.
+
 > Écarté après mesure : **libérer le moteur après une période d'inactivité**. Sur cette
 > pile, le construire coûte environ 210 Mo et le libérer n'en rend que 32 au système,
 > le reste étant retenu par l'allocateur puis réutilisé au chargement suivant (vérifié
