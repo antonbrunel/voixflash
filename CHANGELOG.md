@@ -39,6 +39,28 @@
   cette vidéo », « Abonnez-vous ») sont écartées quand elles constituent la totalité du
   texte reconnu, et uniquement dans ce cas : « Abonnez-vous à la newsletter avant
   vendredi » reste une vraie dictée.
+- **Dictée mains libres**, à activer dans « Touche de dictée ». Un appui bref verrouille
+  la capture : on parle sans rien tenir, un nouvel appui arrête, Échap annule. La
+  mention « mains libres » s'affiche à côté de l'icône tant que ça tourne, parce qu'un
+  micro qui enregistre pendant que l'utilisateur ne tient rien doit se voir. Désactivé
+  par défaut : sur une touche modificatrice, activer ce mode fait de chaque effleurement
+  une dictée.
+- **« Recoller la dernière dictée »** dans le menu. Un collage peut échouer sans le
+  moindre message (champ qui refuse Cmd+V, application qui n'avait pas le focus). Le
+  texte, lui, est toujours en base.
+- **Espace après le texte collé**, en option, pour que deux dictées enchaînées ne se
+  collent pas bord à bord.
+- **Plus de refus quand on dicte juste après avoir changé de qualité.** La dictée
+  démarre et attend le moteur, au lieu de répondre « le moteur se charge encore ».
+- **Un seul moteur en mémoire à la fois.** Changer de qualité construisait le nouveau
+  moteur avant de libérer l'ancien : les deux coexistaient le temps du chargement.
+
+> Écarté après mesure : **libérer le moteur après une période d'inactivité**. Sur cette
+> pile, le construire coûte environ 210 Mo et le libérer n'en rend que 32 au système,
+> le reste étant retenu par l'allocateur puis réutilisé au chargement suivant (vérifié
+> sur dix cycles). La fonction n'aurait donc pas rendu de mémoire au Mac, seulement
+> ajouté une attente. Le rechargement, lui, est bien immédiat (0,11 s cache chaud) :
+> c'est ce qui rend l'attente au changement de qualité indolore.
 
 ## 1.5.0 — la dictée sait se faire comprendre
 

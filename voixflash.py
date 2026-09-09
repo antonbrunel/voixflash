@@ -19,6 +19,7 @@ Choix techniques (volontaires, voir le cahier des charges) :
 """
 
 import os
+import gc
 import re
 import sys
 import json
@@ -158,6 +159,9 @@ CLIP_ENV = {**os.environ, "LANG": "en_US.UTF-8", "LC_CTYPE": "en_US.UTF-8"}
 # Garde-fous de durée : évite un micro oublié et une consommation mémoire qui gonfle.
 MAX_MEETING_SECONDS = 3 * 60 * 60   # arrêt auto d'une réunion après 3 h
 MAX_FLASH_SECONDS = 120             # dictée éclair maintenue anormalement longtemps
+# En mains libres, plus rien n'est tenu : la limite ne peut plus être « la touche est
+# restée enfoncée trop longtemps », elle protège d'un micro qu'on a oublié d'arrêter.
+MAX_HANDSFREE_SECONDS = 10 * 60
 
 # --- Import d'un fichier audio (menu Réunions › « Importer un fichier audio… ») -------
 # On ne décode JAMAIS le fichier entier en mémoire : on le lit en flux et on le transcrit
@@ -195,7 +199,14 @@ DEFAULT_CONFIG = {
     "diarization_speakers": 0,   # plafond de locuteurs attendus (0 = aucune contrainte)
     "remove_hesitations": True,  # retirer les « euh », « hmm » du texte transcrit
     "sounds_enabled": True,      # petits sons au début et à la fin d'une dictée
+    "handsfree_enabled": False,  # appui bref = dictée mains libres (au lieu d'annuler)
+    "paste_trailing_space": False,  # ajouter une espace après le texte collé
 }
+
+# Attente maximale du moteur au moment de transcrire, quand un chargement est en cours
+# (changement de qualité juste avant de dicter). Mieux vaut attendre que refuser : le
+# texte est déjà enregistré, il ne manque que le moteur.
+MODEL_WAIT_S = 90.0
 
 # Traîne conservée après le relâchement de la touche. Le dernier mot est encore en
 # vol dans les tampons de CoreAudio au moment du relâchement : couper net le tronque.
@@ -1718,6 +1729,8 @@ class VoixFlashApp(rumps.App):
         self.model = None                 # le moteur de transcription, chargé en fond
         self.model_name_loaded = None     # nom du modèle actuellement en mémoire
         self._requested_model = self.config["model"]  # dernier modèle DEMANDÉ (le plus récent gagne)
+        self._model_loading = False       # un chargement est-il en cours ?
+        self._model_unloaded = False      # libéré PAR NOUS (donc rechargeable vite)
         self._state = "loading"
         self._recording = False
         # Une transcription est-elle EN COURS (réunion/dictée OU import de fichier) ? Le
@@ -1731,6 +1744,8 @@ class VoixFlashApp(rumps.App):
         self._record_mode = None          # "flash" ou "meeting"
         self._ptt_active = False          # touche de dictée actuellement maintenue ?
         self._ptt_started = None          # instant d'appui (mesure des appuis trop brefs)
+        self._handsfree = False           # dictée qui continue sans tenir la touche
+        self._handsfree_since = None      # instant d'engagement (anti-rebond)
         self._capturing = False           # en train de capturer une nouvelle touche ?
         self._sounds = Sounds()           # lecteurs préparés une fois pour toutes
         self._wake_observer = None        # abonnement au réveil du Mac
@@ -1769,7 +1784,7 @@ class VoixFlashApp(rumps.App):
         self._install_timer_common_modes()
 
         # Chargement du modèle en arrière-plan → démarrage instantané de l'app.
-        threading.Thread(target=self._load_model, daemon=True).start()
+        self._start_model_load()
 
         # Amorce du micro (une seule fois) : ouvre brièvement l'entrée audio pour
         # DÉCLENCHER la demande d'autorisation macOS. Sans ça, « Python » n'apparaît
@@ -1827,6 +1842,12 @@ class VoixFlashApp(rumps.App):
                                          callback=self.toggle_hesitations)
         self.sound_item = rumps.MenuItem("Retour sonore (début et fin de dictée)",
                                          callback=self.toggle_sounds)
+        self.handsfree_item = rumps.MenuItem("Mains libres : appui bref pour verrouiller",
+                                             callback=self.toggle_handsfree)
+        self.space_item = rumps.MenuItem("Ajouter une espace après le texte collé",
+                                         callback=self.toggle_paste_space)
+        self.repaste_item = rumps.MenuItem("Recoller la dernière dictée",
+                                           callback=self.paste_last_result)
         self.help_menu = rumps.MenuItem("Aide & autorisations")
 
         self.menu = [
@@ -1841,6 +1862,7 @@ class VoixFlashApp(rumps.App):
             self.hotkey_menu,
             self.sound_item,
             self.restore_item,
+            self.repaste_item,
             rumps.separator,
             self.help_menu,
             rumps.MenuItem("Redémarrer VoixFlash", callback=self.restart_app),
@@ -1861,6 +1883,7 @@ class VoixFlashApp(rumps.App):
                                           callback=self.vocab_open_file))
         self.text_menu.add(rumps.separator)
         self.text_menu.add(self.hesit_item)
+        self.text_menu.add(self.space_item)
 
         self.import_item = rumps.MenuItem(IMPORT_IDLE_TITLE, callback=self.import_audio_file)
         self.reunions_menu.add(self.import_item)
@@ -1887,6 +1910,8 @@ class VoixFlashApp(rumps.App):
         self.restore_item.state = bool(self.config["restore_clipboard"])
         self.hesit_item.state = bool(self.config.get("remove_hesitations", True))
         self.sound_item.state = bool(self.config.get("sounds_enabled", True))
+        self.space_item.state = bool(self.config.get("paste_trailing_space"))
+        self.handsfree_item.state = bool(self.config.get("handsfree_enabled"))
 
         # Sous-menu d'aide : guide complet en tête, puis liens vers les réglages macOS.
         self.help_menu.add(rumps.MenuItem("Mode d'emploi complet", callback=self.show_guide))
@@ -1938,6 +1963,10 @@ class VoixFlashApp(rumps.App):
         cap = rumps.MenuItem(cap_title, callback=self.start_hotkey_capture)
         cap.state = not is_preset
         self.hotkey_menu.add(cap)
+        # Mains libres : c'est un comportement de la MÊME touche, sa place est ici.
+        self.hotkey_menu.add(rumps.separator)
+        self.handsfree_item.state = bool(self.config.get("handsfree_enabled"))
+        self.hotkey_menu.add(self.handsfree_item)
 
     def _refresh_history_menu(self):
         """Reconstruit le sous-menu d'historique : entrées récentes cliquables (→ fenêtre
@@ -1983,6 +2012,11 @@ class VoixFlashApp(rumps.App):
             # évite d'écraser self.model par un modèle obsolète ou d'empiler des alertes.
             with self._lock:
                 self._requested_model = val
+            # L'ancien moteur est libéré AVANT de construire le nouveau : les garder
+            # tous les deux le temps du chargement doublerait le pic mémoire, jusqu'à
+            # 3 Go sur les grosses qualités.
+            if self.model_name_loaded not in (None, val):
+                self._unload_model()
             # Si le modèle n'est pas encore téléchargé, on prévient : c'est l'attente
             # « longue » (jusqu'à ~1 min) qui surprenait. Sinon (déjà en cache), le
             # chargement est rapide et l'icône suffit comme retour.
@@ -1995,8 +2029,7 @@ class VoixFlashApp(rumps.App):
             # On passe le nom explicitement (pas via la config, qui peut changer) et
             # announce=True : on confirme « prêt » à la fin (changement demandé par
             # l'utilisateur ; au démarrage on reste muet).
-            threading.Thread(target=self._load_model, kwargs={"name": val, "announce": True},
-                             daemon=True).start()
+            self._start_model_load(name=val, announce=True)
         return cb
 
     def _make_lang_cb(self, val):
@@ -2019,7 +2052,7 @@ class VoixFlashApp(rumps.App):
                 self.config["hotkey_label"] = label
                 save_json(CONFIG_PATH, self.config)
                 self._hotkey = parse_hotkey(val)
-                self._ptt_active = False
+                self._reset_ptt()
                 self._refresh_hotkey_menu()
                 # Retour RÉELLEMENT visible (les notifications macOS ne marchent pas hors
                 # bundle) : on ouvre l'alerte au tour de boucle suivant pour ne pas la
@@ -2086,7 +2119,7 @@ class VoixFlashApp(rumps.App):
         self.config["hotkey_label"] = label
         save_json(CONFIG_PATH, self.config)
         self._hotkey = parse_hotkey(serialized)
-        self._ptt_active = False
+        self._reset_ptt()
         self._refresh_hotkey_menu()
 
         # Avertissement doux si la touche produit aussi un caractère (risque de l'écrire).
@@ -2201,6 +2234,16 @@ class VoixFlashApp(rumps.App):
         self._symbol_cache[symbol_name] = img
         return img
 
+    def _handsfree_label(self, on):
+        """Affiche « mains libres » à côté de l'icône pendant une dictée sans maintien.
+
+        C'est le seul état de l'application où le micro tourne alors que l'utilisateur
+        ne tient rien : sans mention explicite, il n'a aucun moyen de le savoir."""
+        try:
+            self.title = " mains libres" if on else None
+        except Exception as e:
+            log(f"libellé mains libres : {e}")
+
     def _apply_state_icon(self, state):
         """Affiche l'état via une icône monochrome native (repli : emoji en titre)."""
         img = self._symbol_image(STATE_SYMBOLS.get(state, "mic.fill"))
@@ -2239,14 +2282,75 @@ class VoixFlashApp(rumps.App):
         save_json(CONFIG_PATH, self.config)
 
     # --------------------------------------------------------- modèle Whisper --
-    def _load_model(self, name=None, announce=False):
+    # -------------------------------------------- cycle de vie du moteur --
+    def _unload_model(self):
+        """Libère le moteur AVANT d'en construire un autre (changement de qualité).
+
+        Mesuré sur cette pile : construire le moteur coûte environ 210 Mo, et le
+        libérer n'en rend que 32 au système, le reste étant retenu par l'allocateur.
+        Ce n'est donc pas une façon de rendre de la mémoire au Mac, et c'est pourquoi
+        il n'y a PAS de libération automatique au repos. En revanche l'allocateur
+        REUTILISE bien ces pages : libérer l'ancien moteur avant de construire le
+        nouveau évite de faire coexister les deux, ce qui doublerait le pic."""
+        with self._lock:
+            if self.model is None or self._model_loading:
+                return
+            name = self.model_name_loaded
+            self.model = None
+            self.model_name_loaded = None
+            self._model_unloaded = True
+        gc.collect()
+        log(f"Moteur « {name} » libéré avant le chargement du suivant.")
+
+    def _start_model_load(self, name=None, **kwargs):
+        """Lance un chargement en fond, en posant le drapeau AVANT de démarrer le thread.
+
+        Le poser dans le thread laisserait une fenêtre pendant laquelle un second
+        appelant croirait qu'aucun chargement n'est en cours et en démarrerait un
+        deuxième : deux moteurs en mémoire en même temps, ce qui est exactement le pic
+        qu'on cherche à éviter."""
+        with self._lock:
+            self._model_loading = True
+            target = name or self._requested_model
+        threading.Thread(target=self._load_model,
+                         kwargs={"name": target, **kwargs}, daemon=True).start()
+
+    def _ensure_model_async(self):
+        """Relance le chargement du moteur s'il a été déchargé. Ne bloque jamais."""
+        with self._lock:
+            if self.model is not None or self._model_loading:
+                return
+        self._start_model_load(quiet=True)
+
+    def _await_model(self, timeout=MODEL_WAIT_S):
+        """Attend que le moteur soit de nouveau chargé. Renvoie le moteur ou None.
+
+        Appelé depuis un thread de fond, au moment de transcrire : si le moteur avait
+        été libéré au repos, l'attente s'est déjà largement recouverte avec le temps
+        de parole et il ne reste en général rien à attendre."""
+        self._ensure_model_async()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                model = self.model
+            if model is not None:
+                return model
+            time.sleep(0.2)
+        return None
+
+    def _load_model(self, name=None, announce=False, quiet=False):
         """Charge (ou recharge) le moteur de transcription, en arrière-plan.
         name : modèle à charger (par défaut celui de la config, pour le démarrage).
         announce=True : informe l'utilisateur quand le modèle est prêt (changement
-        demandé via le menu) ; au démarrage on reste silencieux."""
+        demandé via le menu) ; au démarrage on reste silencieux.
+        quiet=True : rechargement automatique après libération au repos — on ne touche
+        pas à l'indicateur, qui affiche déjà « enregistrement »."""
         if name is None:
             name = self.config["model"]
-        self._ui_queue.put(("state", "loading"))
+        with self._lock:
+            self._model_loading = True
+        if not quiet:
+            self._ui_queue.put(("state", "loading"))
         try:
             # device="cpu" et compute_type="int8" : impératif sur Apple Silicon
             # (jamais le GPU/mps), rapide et léger en mémoire.
@@ -2288,6 +2392,7 @@ class VoixFlashApp(rumps.App):
                 if name == self._requested_model:
                     self.model = model
                     self.model_name_loaded = name
+                    self._model_unloaded = False
                     committed = True
             if committed and announce:
                 self._ui_queue.put(("info", ("Modèle prêt",
@@ -2298,10 +2403,14 @@ class VoixFlashApp(rumps.App):
             log(f"Erreur de chargement du modèle '{name}' : {e}")
             self._ui_queue.put(("error", f"Impossible de charger le modèle « {name} » : {e}"))
         finally:
+            with self._lock:
+                self._model_loading = False
             # On ne remet « prêt » (icône pleine) que pour le chargement courant : un
             # chargement obsolète ne doit pas faire croire que tout est prêt alors que
-            # le bon modèle se charge encore.
-            if not self._recording and name == self._requested_model:
+            # le bon modèle se charge encore. Et jamais pendant un enregistrement ou une
+            # transcription, dont l'indicateur doit rester visible.
+            if (not quiet and not self._recording and not self._transcribing
+                    and name == self._requested_model):
                 self._ui_queue.put(("state", "idle"))
 
     # --------------------------------------------------------- écoute clavier --
@@ -2347,6 +2456,17 @@ class VoixFlashApp(rumps.App):
         except Exception as e:
             log(f"réarmement de l'écoute : {e}")
 
+    def _reset_ptt(self):
+        """Repart d'un état de touche propre : plus rien de tenu, plus de mains libres.
+
+        Le mode mains libres n'a de sens que tant que la touche qui l'a engagé reste
+        celle qu'on écoute. Le laisser actif après un changement de raccourci ou une
+        relance de l'écoute laisserait un micro ouvert que plus aucune touche n'arrête."""
+        self._ptt_active = False
+        if self._handsfree:
+            self._handsfree = False
+            self._ui_queue.put(("handsfree", False))
+
     def _start_listener(self):
         """(Re)démarre l'écoute clavier globale pour la dictée éclair."""
         if self._listener is not None:
@@ -2354,7 +2474,7 @@ class VoixFlashApp(rumps.App):
                 self._listener.stop()
             except Exception:
                 pass
-        self._ptt_active = False          # on repart d'un état propre
+        self._reset_ptt()                 # on repart d'un état propre
         self._hotkey = parse_hotkey(self.config["hotkey"])
         self._listener = keyboard.Listener(on_press=self._on_press, on_release=self._on_release)
         self._listener.daemon = True
@@ -2368,6 +2488,27 @@ class VoixFlashApp(rumps.App):
             # ne déclenche surtout pas d'enregistrement.
             if self._capturing:
                 self._captured = key
+                return
+            # Mains libres : la capture continue alors que plus rien n'est tenu. Le
+            # prochain appui de la touche l'arrête, Échap l'annule. Sans ce bloc,
+            # l'appui d'arrêt retomberait sur « un enregistrement est déjà en cours »
+            # et la bascule resterait coincée, micro ouvert.
+            if self._handsfree:
+                if key == keyboard.Key.esc:
+                    self._handsfree = False
+                    self._ui_queue.put(("handsfree", False))
+                    self._cancel_recording("annulée (Échap, mains libres)")
+                    return
+                if key_matches(key, self._hotkey):
+                    # Petite garde : absorbe l'auto-répétition du clavier et un double
+                    # appui involontaire juste après l'engagement.
+                    if time.monotonic() - (self._handsfree_since or 0.0) < SHORT_TAP_S:
+                        return
+                    self._handsfree = False
+                    self._ui_queue.put(("handsfree", False))
+                    if self.config.get("sounds_enabled", True):
+                        self._sounds.play("stop")
+                    self._stop_recording()
                 return
             if self._ptt_active:
                 if key_matches(key, self._hotkey):
@@ -2389,9 +2530,16 @@ class VoixFlashApp(rumps.App):
             if self._transcribing:            # un import/une transcription tourne déjà
                 self._ui_queue.put(("error", "Une transcription est déjà en cours, réessaie dans un instant."))
                 return
-            if self.model is None:            # le moteur n'est pas encore prêt
-                self._ui_queue.put(("error", "Le moteur de transcription se charge encore, réessaie dans un instant."))
-                return
+            if self.model is None:
+                if not self._model_unloaded:
+                    # Tout premier chargement (ou téléchargement) : rien ne garantit
+                    # qu'il aboutira vite, on ne fait pas parler dans le vide.
+                    self._ui_queue.put(("error", "Le moteur de transcription se charge encore, réessaie dans un instant."))
+                    return
+                # Moteur libéré pour laisser la place au nouveau (changement de
+                # qualité juste avant) : on le rappelle et on enregistre tout de
+                # suite. Le chargement se recouvre avec le temps de parole.
+                self._ensure_model_async()
             self._ptt_active = True
             self._ptt_started = time.monotonic()
             self._start_recording("flash")
@@ -2409,13 +2557,25 @@ class VoixFlashApp(rumps.App):
                 return
             self._ptt_active = False
             held = time.monotonic() - (self._ptt_started or 0.0)
-            # Appui trop bref pour être une dictée : on jette. Réservé aux touches
-            # MODIFICATRICES, qu'on effleure souvent sans intention. Appliquée à une
-            # touche ordinaire, cette règle jetterait de vraies dictées : l'utilisateur
-            # peut relâcher la touche aussitôt et continuer à parler.
-            if hotkey_is_modifier(self._hotkey) and held < SHORT_TAP_S:
-                self._cancel_recording(f"ignorée (appui de {held * 1000:.0f} ms)")
-                return
+            # Appui bref : deux lectures possibles, et c'est un réglage parce qu'elles
+            # s'excluent. Sans le mode mains libres, un effleurement est une fausse
+            # manoeuvre et on jette. Avec, c'est la demande de continuer à parler sans
+            # tenir la touche, et le prochain appui arrêtera.
+            if held < SHORT_TAP_S:
+                if self.config.get("handsfree_enabled"):
+                    self._handsfree = True
+                    self._handsfree_since = time.monotonic()
+                    log(f"Dictée mains libres engagée (appui de {held * 1000:.0f} ms).")
+                    self._ui_queue.put(("handsfree", True))
+                    if self.config.get("sounds_enabled", True):
+                        self._sounds.play("start")
+                    return
+                # Réservé aux touches MODIFICATRICES, qu'on effleure souvent sans
+                # intention. Appliquée à une touche ordinaire, cette règle jetterait de
+                # vraies dictées : on peut relâcher aussitôt et continuer à parler.
+                if hotkey_is_modifier(self._hotkey):
+                    self._cancel_recording(f"ignorée (appui de {held * 1000:.0f} ms)")
+                    return
             if self.config.get("sounds_enabled", True):
                 self._sounds.play("stop")
             self._stop_recording()
@@ -2670,7 +2830,7 @@ class VoixFlashApp(rumps.App):
         # Remis à zéro AVANT toute sortie anticipée : si l'ouverture du micro avait
         # échoué, l'état « touche maintenue » resterait sinon coincé à vrai et plus
         # aucune dictée ne démarrerait.
-        self._ptt_active = False
+        self._reset_ptt()
         with self._lock:
             if not self._recording:
                 return
@@ -2840,6 +3000,10 @@ class VoixFlashApp(rumps.App):
 
             with self._lock:
                 model = self.model
+            if model is None:
+                # Chargement encore en cours : l'attente s'est déjà largement
+                # recouverte avec le temps de parole.
+                model = self._await_model()
             if model is None:
                 self._ui_queue.put(("error", "Moteur de transcription indisponible. "
                                              "L'enregistrement est conservé : il te sera "
@@ -3142,8 +3306,40 @@ class VoixFlashApp(rumps.App):
                 return
         self._pb_restore(pb, snap)
 
+    def paste_last_result(self, _sender):
+        """Recolle la dernière dictée. Filet de rattrapage de tous les échecs de collage.
+
+        Un collage peut échouer sans que rien ne le signale : champ qui refuse Cmd+V,
+        application qui n'avait pas le focus, autorisation retirée entre-temps. Le
+        texte, lui, est toujours en base. Ce point d'entrée le remet dans le
+        presse-papiers et relance le collage."""
+        entry = None
+        for e in history_recent(15):
+            if e.get("mode") == "flash" and (e.get("text") or "").strip():
+                entry = e
+                break
+        if entry is None:
+            self._show_info("Rien à recoller", "Aucune dictée récente dans l'historique.")
+            return
+        self._ui_queue.put(("state", "pasting"))
+        threading.Thread(target=self._repaste, args=(entry["text"],), daemon=True).start()
+
+    def _repaste(self, text):
+        """Colle depuis un thread de fond, en laissant le menu se refermer d'abord.
+
+        Sans ce délai, le Cmd+V simulé part alors que le menu de la barre est encore
+        déroulé : c'est LUI qui a le focus clavier, et le texte n'atterrit nulle part."""
+        time.sleep(0.35)
+        self._paste_text(text)
+        self._ui_queue.put(("state", "idle"))
+
     def _paste_text(self, text):
         """Colle le texte au curseur : presse-papiers + Cmd+V simulé (jamais lettre par lettre)."""
+        # Espace de séparation : sans elle, deux dictées enchaînées se collent bord à
+        # bord. Désactivée par défaut, parce qu'elle est visible dans le document et
+        # qu'elle n'a pas de sens dans les langues qui n'espacent pas les mots.
+        if self.config.get("paste_trailing_space") and text and not text.endswith(" "):
+            text = text + " "
         # Sans l'autorisation « Accessibilité », le Cmd+V simulé n'aurait aucun effet
         # (échec silencieux). On prévient l'utilisateur et on évite d'écraser son
         # presse-papiers ; le texte y est tout de même copié pour un collage manuel.
@@ -3282,6 +3478,13 @@ class VoixFlashApp(rumps.App):
             if kind == "state":
                 self._state = payload
                 self._apply_state_icon(payload)
+                if payload != "recording":
+                    self._handsfree_label(False)
+            elif kind == "handsfree":
+                # Le mode mains libres DOIT se voir. Chez un concurrent il était
+                # invisible dans l'interface, et il a produit une longue série
+                # d'enregistrements déclenchés sans que l'utilisateur le sache.
+                self._handsfree_label(bool(payload))
             elif kind == "history_changed":
                 self._refresh_history_menu()
             elif kind == "meeting_result":
@@ -3390,8 +3593,9 @@ class VoixFlashApp(rumps.App):
                     self._ui_queue.put(("meeting_title", MEETING_START_TITLE))
                     self._stop_recording()
                     self._ui_queue.put(("error", "Réunion arrêtée automatiquement après 3 h."))
-                elif mode == "flash" and elapsed > MAX_FLASH_SECONDS:
-                    self._ptt_active = False
+                elif mode == "flash" and elapsed > (
+                        MAX_HANDSFREE_SECONDS if self._handsfree else MAX_FLASH_SECONDS):
+                    self._reset_ptt()
                     self._stop_recording()
         except Exception as e:
             log(f"watchdog : {e}")
@@ -3463,8 +3667,11 @@ class VoixFlashApp(rumps.App):
                 self._present(self._show_error, "Une transcription est déjà en cours, réessaie dans un instant.")
                 return
             if self.model is None:
-                self._present(self._show_error, "Le moteur de transcription se charge encore, réessaie dans un instant.")
-                return
+                if not self._model_unloaded:
+                    self._present(self._show_error, "Le moteur de transcription se charge encore, réessaie dans un instant.")
+                    return
+                # Chargement en cours : la réunion n'a besoin du moteur qu'à l'arrêt.
+                self._ensure_model_async()
             # On ne met le titre « Arrêter » que si le micro s'est réellement ouvert.
             if self._start_recording("meeting"):
                 sender.title = MEETING_STOP_TITLE
@@ -3522,11 +3729,7 @@ class VoixFlashApp(rumps.App):
             log(f"Reprise de la réunion interrompue : {os.path.basename(raw)}")
             # La proposition arrive au démarrage, souvent AVANT que le moteur soit
             # chargé : on l'attend ici plutôt que de renvoyer l'utilisateur à plus tard.
-            attente = 0.0
-            while self.model is None and attente < 180.0:
-                time.sleep(1.0)
-                attente += 1.0
-            if self.model is None:
+            if self.model is None and self._await_model(180.0) is None:
                 self._ui_queue.put(("error", "Le moteur de transcription n'a pas pu être "
                                              "chargé. L'enregistrement est conservé : il te "
                                              "sera reproposé au prochain démarrage."))
@@ -3634,8 +3837,10 @@ class VoixFlashApp(rumps.App):
                              "d'importer un fichier sur cette installation.")
             return
         if self.model is None:
-            self._show_error("Le moteur de transcription se charge encore, réessaie dans un instant.")
-            return
+            if not self._model_unloaded:
+                self._show_error("Le moteur de transcription se charge encore, réessaie dans un instant.")
+                return
+            self._ensure_model_async()   # libéré : il revient tout seul
         # ⚠ L'alerte est affichée HORS du verrou : une fenêtre modale bloque le thread
         # principal jusqu'au clic, et le verrou resterait tenu tout ce temps.
         with self._lock:
@@ -3715,6 +3920,8 @@ class VoixFlashApp(rumps.App):
         try:
             with self._lock:
                 model = self.model
+            if model is None:
+                model = self._await_model()
             if model is None:
                 self._ui_queue.put(("error", "Moteur de transcription indisponible."))
                 return
@@ -3842,6 +4049,40 @@ class VoixFlashApp(rumps.App):
         save_json(CONFIG_PATH, self.config)
         if self.config["sounds_enabled"]:
             self._sounds.play("start")   # aperçu immédiat du son choisi
+
+    def toggle_paste_space(self, sender):
+        self.config["paste_trailing_space"] = not self.config.get("paste_trailing_space")
+        sender.state = self.config["paste_trailing_space"]
+        save_json(CONFIG_PATH, self.config)
+
+    def toggle_handsfree(self, sender):
+        """Bascule le mode mains libres, qui change le sens d'un appui bref.
+
+        Les deux lectures d'un appui bref s'excluent : fausse manoeuvre à jeter, ou
+        demande de continuer à parler sans tenir la touche. D'où un réglage plutôt
+        qu'une heuristique, et un avertissement à l'activation : sur une touche
+        modificatrice, la protection contre les effleurements disparaît."""
+        new = not bool(self.config.get("handsfree_enabled"))
+        self.config["handsfree_enabled"] = new
+        sender.state = new
+        save_json(CONFIG_PATH, self.config)
+        if not new:
+            self._reset_ptt()
+            return
+        note = ""
+        if hotkey_is_modifier(self._hotkey):
+            note = ("\n\nAttention : ta touche de dictée est un modificateur "
+                    f"({self._current_hotkey_label()}), qu'on effleure souvent sans le "
+                    "vouloir. Chaque effleurement lancera désormais une dictée mains "
+                    "libres. Une touche de fonction (F5, F6) est plus sûre pour ce mode.")
+        self._show_info(
+            "Mains libres activé",
+            "Appuie brièvement sur ta touche de dictée puis relâche : "
+            "l'enregistrement CONTINUE sans que tu tiennes rien.\n\n"
+            "La mention « mains libres » s'affiche à côté de l'icône tant que ça "
+            "tourne. Un nouvel appui arrête et écrit le texte ; Échap annule.\n\n"
+            "Un appui maintenu garde le comportement habituel : on parle tant qu'on "
+            "tient." + note)
 
     def _vocab_prompt(self, title, message, placeholder=""):
         """Petite fenêtre de saisie. Renvoie le texte saisi, ou None si annulé."""
