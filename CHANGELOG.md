@@ -1,5 +1,34 @@
 # Journal des versions — VoixFlash
 
+## 1.4.0 — vocabulaire et collage sûr
+
+- **Vocabulaire personnalisé.** Nouveau menu « Texte dicté ». Tu y ajoutes les mots dont
+  l'orthographe doit être respectée (noms propres, marques, jargon métier) : les variantes
+  approchantes produites par la transcription sont ramenées dessus, y compris quand un mot
+  est découpé en deux ou trois morceaux (« voie flash » devient « VoixFlash »). Tu peux
+  aussi enregistrer des corrections exactes, qui servent également de raccourcis de saisie.
+  Tout est local, sans intelligence artificielle supplémentaire et sans coût de calcul.
+- **Hésitations retirées.** Les « euh », « hmm » et compagnie disparaissent du texte, avec
+  la virgule qu'ils laissaient derrière eux. Désactivable dans le même menu. Les hésitations
+  propres à l'anglais ne sont retirées que si la langue anglaise est certaine.
+- **Bégaiements corrigés.** « Je je je pense » redevient « Je pense ». Deux répétitions sont
+  conservées : « non non c'est bon » est une vraie tournure.
+- **Meilleure ponctuation.** Une courte phrase d'amorce dans la langue choisie est fournie au
+  moteur, qui poursuit dans le même registre et ponctue et accentue plus fidèlement.
+- **Collage sûr.** Le presse-papiers était écrit puis collé après un délai fixe, sans vérifier
+  que l'écriture avait pris : on pouvait coller son contenu précédent. La restauration écrasait
+  par ailleurs ce que tu avais copié entre-temps, et une image ou un fichier copié était perdu
+  sans retour possible. Désormais : toutes les données du presse-papiers sont conservées puis
+  restituées à l'identique, la restauration n'a lieu que si rien d'autre n'est venu s'y mettre,
+  et deux dictées enchaînées rendent bien le contenu d'origine.
+- **Dictées absentes des gestionnaires de presse-papiers.** Raycast, Alfred, Maccy et consorts
+  n'archivent plus le texte dicté.
+- **Raccourci de collage plus fiable.** Le Cmd+V simulé ne peut plus se mélanger à la touche de
+  dictée encore enfoncée.
+- **Longues réunions.** Le pic de mémoire d'une réunion d'une heure passe d'environ 4,4 Go à
+  1 Go : assemblage de l'audio au fil de l'eau et rééchantillonnage par tranches, à résultat
+  identique. C'était la cause probable des arrêts brutaux sur les enregistrements longs.
+
 ## 1.3.0 — fiabilité
 
 Correction des blocages qui obligeaient à forcer la fermeture, et fin de la perte

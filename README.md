@@ -28,6 +28,8 @@ Aucun compte, aucun abonnement, aucune clé. Ta voix ne quitte jamais ton Mac.
 - **Historique** local (dictées + réunions), copiable et exportable, avec **recherche plein-texte**
   (mots-clés, accents ignorés).
 - **Réglages simples** : qualité/vitesse, langue (FR/EN), touche de dictée.
+- **Vocabulaire personnalisé** : tes noms propres et ton jargon écrits correctement, sans
+  intelligence artificielle supplémentaire ni ralentissement.
 
 Un **mode d'emploi complet** est intégré : icône VoixFlash › **Aide & autorisations › Mode d'emploi complet**.
 
@@ -125,7 +127,9 @@ Tout le reste (comportement du presse-papiers, limites, historique…) est déta
 | **Touche de dictée** | Préréglages (Option droite par défaut, Cmd droite, Ctrl droite, F5) **ou « Choisir ma touche… »** : appuie sur la touche que tu veux, elle est captée telle quelle (fiable quel que soit le clavier). |
 | **Réunions › Importer un fichier audio…** | Transcrit un fichier audio/vidéo existant comme une réunion (langue auto, découpage automatique, progression + annulation). |
 | **Réunions › Horodatage** | Ajoute `[mm:ss]` devant chaque passage (réunions **et** imports). |
-| **Restaurer le presse-papiers** | Remet ton ancien presse-papiers après une dictée (activé). |
+| **Texte dicté › Vocabulaire** | Ajoute les noms propres, marques et termes métier tels que tu veux les voir. Les variantes approchantes sont corrigées, même quand le moteur découpe le mot (*voie flash* → *VoixFlash*). Corrections exactes possibles, utilisables aussi comme raccourcis de saisie. |
+| **Texte dicté › Retirer les hésitations** | Efface les « euh » et « hmm » du texte (activé). |
+| **Restaurer le presse-papiers** | Remet ton ancien presse-papiers après une dictée (activé), avec toutes ses données (image, texte enrichi, fichiers). |
 
 ---
 

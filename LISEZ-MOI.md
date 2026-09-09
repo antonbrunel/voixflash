@@ -100,6 +100,13 @@ pastille d'enregistrement = enregistre · forme d'onde = transcrit · presse-pap
   à chaque dictée — pratique pour alterner FR/EN).
 - **Touche de dictée** : préréglages (Option droite par défaut…) ou **« Choisir ma touche… »**
   qui capte la touche que tu presses (fiable quel que soit le clavier).
+- **Texte dicté › Ajouter un mot au vocabulaire…** : écris un nom propre, une marque ou un
+  terme métier tel que tu veux le voir apparaître. Les variantes approchantes sont corrigées
+  automatiquement, même quand le moteur découpe le mot (*voie flash* devient *VoixFlash*).
+  C'est le réglage qui change le plus de choses au quotidien.
+- **Texte dicté › Corriger une faute récurrente…** : remplacement exact, de la version fautive
+  vers la bonne. Sert aussi de raccourci de saisie (une phrase courte qui devient une signature).
+- **Texte dicté › Retirer les hésitations** : efface les « euh » et « hmm » (activé).
 - **Réunions › Importer un fichier audio…** : transcrit un fichier audio/vidéo existant
   (langue auto, découpage automatique, progression, annulable).
 - **Réunions › Horodatage des passages** : ajoute `[mm:ss]` devant chaque passage (réunions et imports).

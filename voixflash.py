@@ -19,10 +19,12 @@ Choix techniques (volontaires, voir le cahier des charges) :
 """
 
 import os
+import re
 import sys
 import json
 import time
 import queue
+import unicodedata
 import socket
 import sqlite3
 import contextlib
@@ -90,7 +92,7 @@ except Exception:
 #  Chemins & constantes
 # --------------------------------------------------------------------------- #
 APP_NAME = "VoixFlash"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 LAUNCHD_LABEL = "com.voixflash.agent"   # étiquette du LaunchAgent (cf. install.command)
 APP_HOME = os.path.expanduser(f"~/Library/Application Support/{APP_NAME}")
 CONFIG_PATH = os.path.join(APP_HOME, "config.json")
@@ -183,6 +185,17 @@ DEFAULT_CONFIG = {
     "mic_primed": False,         # le micro a-t-il déjà été « amorcé » (demande d'autorisation déclenchée) ?
     "diarization_enabled": False,  # séparer les locuteurs en réunion (« Locuteur 1 : … »)
     "diarization_speakers": 0,   # nb de locuteurs attendus (0 = détection automatique)
+    "remove_hesitations": True,  # retirer les « euh », « hmm » du texte transcrit
+}
+
+# Amorce de style passée à Whisper : ce n'est PAS du vocabulaire, mais une phrase
+# correctement ponctuée et accentuée dans la langue visée. Le modèle poursuit dans
+# le registre de son amorce, donc il ponctue et il accentue mieux. Volontairement
+# très courte : Whisper tronque l'amorce au-delà de 224 jetons, et une amorce
+# chargée de vocabulaire dégraderait la transcription au lieu de l'aider.
+STYLE_PROMPTS = {
+    "fr": "Bonjour, comment allez-vous ? Ravi de vous rencontrer.",
+    "en": "Hello, how are you? Nice to meet you.",
 }
 
 # Icône d'état dans la barre des menus. On utilise des symboles SF (les mêmes
@@ -389,6 +402,217 @@ def is_probably_hallucination(text):
     """True si le texte se résume à une phrase parasite connue de Whisper (silence)."""
     t = " ".join((text or "").lower().split())
     return bool(t) and any(marker in t for marker in HALLUCINATION_MARKERS)
+
+
+# ------------------------------------------------- post-traitement du texte --
+# Tout se fait APRÈS la transcription, sur la sortie réelle du modèle. Le
+# vocabulaire n'est volontairement PAS passé au décodeur (hotwords /
+# initial_prompt) : les projets concurrents qui l'ont fait ont dû le désactiver
+# en urgence, de courtes listes de mots dominant la sortie et DÉGRADANT le taux
+# d'erreur. Corriger après coup donne l'essentiel du bénéfice sans ce risque.
+
+VOCAB_PATH = os.path.join(APP_HOME, "vocabulaire.json")
+
+# Hésitations pures : ce ne sont des mots ni en français ni en anglais.
+FILLERS_UNIVERSAL = ("euh", "euhm", "euhh", "heu", "heuh", "hmm", "hmmm",
+                     "hum", "humm", "mmm", "mmh", "ehm", "ehmm")
+# Hésitations anglaises : « um » est un mot dans d'autres langues (portugais),
+# on ne les retire donc que si la langue anglaise est établie.
+FILLERS_EN = ("um", "umm", "uh", "uhm", "erm")
+
+# Un mot = lettres/chiffres, apostrophes internes comprises (« aujourd'hui »).
+WORD_RE = re.compile(r"\w+(?:['’]\w+)*", re.UNICODE)
+
+
+def strip_accents(s):
+    """Retire les signes diacritiques (é → e)."""
+    return "".join(c for c in unicodedata.normalize("NFD", s)
+                   if unicodedata.category(c) != "Mn")
+
+
+def fold_key(s):
+    """Clé de rapprochement : minuscules, sans accents, sans ponctuation.
+
+    C'est elle qui fait que « Grôb » rejoint « Grob » et « voie flash »
+    rejoint « VoixFlash » (une seule substitution d'écart)."""
+    return "".join(ch for ch in strip_accents(s).lower() if ch.isalnum())
+
+
+def edit_distance(a, b, cap):
+    """Distance de Levenshtein, abandonnée dès qu'elle dépasse `cap`.
+
+    L'abandon anticipé est ce qui rend le rapprochement utilisable sur une
+    réunion entière : la grande majorité des paires est écartée en une ligne."""
+    if abs(len(a) - len(b)) > cap:
+        return cap + 1
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        best = i
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1,
+                           prev[j - 1] + (0 if ca == cb else 1)))
+            if cur[j] < best:
+                best = cur[j]
+        if best > cap:
+            return cap + 1
+        prev = cur
+    return prev[-1]
+
+
+def fail_open(step):
+    """Une étape de nettoyage ne doit JAMAIS faire perdre une dictée réussie.
+
+    En cas d'erreur (règle mal formée, entrée exotique), on rend le texte reçu
+    tel quel plutôt que de propager l'exception."""
+    def wrapper(text, *args, **kwargs):
+        try:
+            out = step(text, *args, **kwargs)
+            return out if isinstance(out, str) else text
+        except Exception as e:
+            log(f"post-traitement « {step.__name__} » ignoré : {e}")
+            return text
+    wrapper.__name__ = step.__name__
+    return wrapper
+
+
+@fail_open
+def remove_fillers(text, language="fr"):
+    """Retire les hésitations, avec la virgule orpheline qu'elles laissent."""
+    words = list(FILLERS_UNIVERSAL)
+    if language == "en":
+        words += list(FILLERS_EN)
+    pattern = r"\b(?:%s)\b[^\S\n]*,?" % "|".join(re.escape(w) for w in words)
+    return re.sub(pattern, "", text, flags=re.IGNORECASE)
+
+
+@fail_open
+def collapse_stutters(text):
+    """Trois répétitions consécutives ou plus d'un même mot → une seule.
+
+    Deux répétitions sont conservées volontairement : « non non c'est bon »
+    est une vraie tournure, alors que « je je je » est un bégaiement de Whisper."""
+    return re.sub(r"\b(\w+)((?:[^\S\n]+\1\b){2,})", r"\1", text, flags=re.IGNORECASE)
+
+
+@fail_open
+def apply_corrections(text, corrections):
+    """Remplacements exacts déclencheur → remplacement, les plus longs d'abord.
+
+    Le remplacement passe par une fonction et jamais par une chaîne de motif :
+    sinon un « $ » ou un « \\ » dans le texte de remplacement serait interprété."""
+    for trigger in sorted(corrections, key=len, reverse=True):
+        repl = corrections[trigger]
+        text = re.sub(r"(?<!\w)%s(?!\w)" % re.escape(trigger),
+                      lambda _m, r=repl: r, text, flags=re.IGNORECASE)
+    return text
+
+
+@fail_open
+def apply_vocabulary(text, words, threshold=0.18):
+    """Rapproche les groupes de 1 à 3 mots du vocabulaire de l'utilisateur.
+
+    Les groupes servent à rattraper ce que Whisper découpe (« voie flash » →
+    « VoixFlash »). Un candidat n'est retenu que si sa distance d'édition
+    rapportée à sa longueur passe sous le seuil : les mots courts sont donc
+    naturellement protégés, une seule faute y pesant trop lourd."""
+    targets = [(w, fold_key(w)) for w in (words or [])]
+    targets = [(w, k) for (w, k) in targets if k and len(k) <= 50]
+    if not targets:
+        return text
+    tokens = [(m.start(), m.end()) for m in WORD_RE.finditer(text)]
+    if not tokens:
+        return text
+    out, last, i = [], 0, 0
+    while i < len(tokens):
+        hit = None
+        for n in (3, 2, 1):
+            if i + n > len(tokens):
+                continue
+            start, end = tokens[i][0], tokens[i + n - 1][1]
+            span = text[start:end]
+            # Un groupe ne franchit jamais une ponctuation : « ... flash. Voie ... »
+            # ne doit pas être recollé en un seul candidat.
+            if n > 1 and re.search(r"[^\w \t'’-]", span):
+                continue
+            key = fold_key(span)
+            if not key or len(key) > 50:
+                continue
+            best = None
+            for (w, wk) in targets:
+                if wk == key:
+                    # Mêmes lettres à la casse et aux accents près : c'est l'usage
+                    # « ancre » du vocabulaire (imposer Grob, Kubernetes, VoixFlash).
+                    # Ce cas doit passer AVANT la protection des mots courts.
+                    best = (0.0, w)
+                    break
+                longest = max(len(wk), len(key))
+                if abs(len(wk) - len(key)) > max(2, longest // 4):
+                    continue
+                cap = int(threshold * longest)
+                if cap < 1:
+                    continue          # mot trop court pour tolérer la moindre faute
+                d = edit_distance(key, wk, cap)
+                if d <= cap:
+                    score = d / longest
+                    if best is None or score < best[0]:
+                        best = (score, w)
+            if best is not None:
+                hit = (start, end, best[1], n)
+                break
+        if hit:
+            start, end, word, n = hit
+            out.append(text[last:start])
+            out.append(word)
+            last = end
+            i += n
+        else:
+            i += 1
+    out.append(text[last:])
+    return "".join(out)
+
+
+@fail_open
+def tidy_spacing(text):
+    """Espaces multiples et espaces parasites laissés par les étapes précédentes.
+
+    On ne touche PAS aux espaces avant « ; : ! ? » : la typographie française
+    les exige, et Whisper les produit correctement."""
+    text = re.sub(r"[^\S\n]{2,}", " ", text)
+    text = re.sub(r"[^\S\n]+([,.])", r"\1", text)
+    text = re.sub(r"[^\S\n]*\n[^\S\n]*", "\n", text)
+    return text.strip()
+
+
+def load_vocabulary():
+    """Lit le vocabulaire de l'utilisateur (mots à faire respecter, corrections)."""
+    data = load_json(VOCAB_PATH, None)
+    if not isinstance(data, dict):
+        return {"mots": [], "corrections": {}}
+    mots = [w.strip() for w in (data.get("mots") or [])
+            if isinstance(w, str) and w.strip()]
+    corrections = {k.strip(): v for k, v in (data.get("corrections") or {}).items()
+                   if isinstance(k, str) and isinstance(v, str) and k.strip()}
+    return {"mots": mots, "corrections": corrections}
+
+
+def postprocess_text(text, language="fr", vocab=None, remove_hesitations=True):
+    """Chaîne de nettoyage locale, déterministe et sans inférence."""
+    if not text:
+        return text
+    text = unicodedata.normalize("NFC", text)
+    started_upper = text[:1].isupper()
+    if remove_hesitations:
+        text = remove_fillers(text, language)
+    vocab = vocab or {}
+    text = apply_vocabulary(text, vocab.get("mots"))
+    text = apply_corrections(text, vocab.get("corrections") or {})
+    text = collapse_stutters(text)
+    text = tidy_spacing(text)
+    # « Euh, demain matin » ne doit pas devenir « demain matin » en minuscule.
+    if started_upper and text[:1].islower():
+        text = text[:1].upper() + text[1:]
+    return text
 
 
 def model_is_cached(name):
@@ -1088,6 +1312,9 @@ class VoixFlashApp(rumps.App):
         self.ts_item = rumps.MenuItem("Horodatage des passages", callback=self.toggle_timestamps)
         self.restore_item = rumps.MenuItem("Restaurer le presse-papiers après une dictée",
                                            callback=self.toggle_restore)
+        self.text_menu = rumps.MenuItem("Texte dicté")
+        self.hesit_item = rumps.MenuItem("Retirer les hésitations (euh, hmm)",
+                                         callback=self.toggle_hesitations)
         self.help_menu = rumps.MenuItem("Aide & autorisations")
 
         self.menu = [
@@ -1098,6 +1325,7 @@ class VoixFlashApp(rumps.App):
             self.reunions_menu,
             self.quality_menu,
             self.lang_menu,
+            self.text_menu,
             self.hotkey_menu,
             self.restore_item,
             rumps.separator,
@@ -1110,6 +1338,17 @@ class VoixFlashApp(rumps.App):
         # « Importer un fichier audio… » : transcrit un fichier existant (ou la piste audio
         # d'une vidéo) exactement comme une réunion. L'item bascule en « Annuler… » pendant
         # le traitement (cf. import_audio_file / _run_import).
+        # Sous-menu « Texte dicté » : vocabulaire de l'utilisateur et nettoyage. Le
+        # vocabulaire est appliqué APRÈS la transcription (cf. postprocess_text).
+        self.text_menu.add(rumps.MenuItem("Ajouter un mot au vocabulaire…",
+                                          callback=self.vocab_add_word))
+        self.text_menu.add(rumps.MenuItem("Corriger une faute récurrente…",
+                                          callback=self.vocab_add_correction))
+        self.text_menu.add(rumps.MenuItem("Ouvrir le fichier de vocabulaire…",
+                                          callback=self.vocab_open_file))
+        self.text_menu.add(rumps.separator)
+        self.text_menu.add(self.hesit_item)
+
         self.import_item = rumps.MenuItem(IMPORT_IDLE_TITLE, callback=self.import_audio_file)
         self.reunions_menu.add(self.import_item)
         self.reunions_menu.add(rumps.MenuItem("Exporter la dernière réunion (.txt)",
@@ -1133,6 +1372,7 @@ class VoixFlashApp(rumps.App):
         self._refresh_diar_menu()
         self.ts_item.state = bool(self.config["meeting_timestamps"])
         self.restore_item.state = bool(self.config["restore_clipboard"])
+        self.hesit_item.state = bool(self.config.get("remove_hesitations", True))
 
         # Sous-menu d'aide : guide complet en tête, puis liens vers les réglages macOS.
         self.help_menu.add(rumps.MenuItem("Mode d'emploi complet", callback=self.show_guide))
@@ -1878,6 +2118,24 @@ class VoixFlashApp(rumps.App):
         return out
 
     # ----------------------------------------------------- transcription --
+    def _effective_language(self, info=None):
+        """Langue à retenir pour le nettoyage du texte.
+
+        Le choix explicite de l'utilisateur prime. En mode « auto », on ne se fie à
+        la détection de Whisper que si elle est SÛRE : retirer des hésitations sur
+        une langue mal devinée effacerait de vrais mots (« um » est un article en
+        portugais). Dans le doute on rend une chaîne vide, et seules les hésitations
+        universelles sont retirées."""
+        lang = self.config.get("language", "fr")
+        if lang != "auto":
+            return lang
+        try:
+            if float(getattr(info, "language_probability", 0) or 0) >= 0.9:
+                return str(getattr(info, "language", "") or "")
+        except Exception:
+            pass
+        return ""
+
     def _process_audio(self, audio, sr, mode, backup=None):
         """Transcrit l'audio d'une dictée ou d'une réunion. Thread de fond.
 
@@ -1919,6 +2177,7 @@ class VoixFlashApp(rumps.App):
                 beam_size=int(self.config.get("beam_size", 5)),
                 vad_filter=(mode == "meeting"),
                 condition_on_previous_text=False,
+                initial_prompt=STYLE_PROMPTS.get(whisper_lang),
             )
             # faster-whisper renvoie un GÉNÉRATEUR : le calcul se fait au fur et à
             # mesure qu'on le parcourt. On en profite pour afficher une progression
@@ -1962,6 +2221,16 @@ class VoixFlashApp(rumps.App):
             if is_probably_hallucination(text):
                 log(f"Transcription écartée (probable hallucination) : {text!r}")
                 text = ""
+
+            # Nettoyage local : hésitations, vocabulaire de l'utilisateur, bégaiements.
+            # Le vocabulaire est relu à chaque fois : une modification du fichier prend
+            # effet immédiatement, sans redémarrer l'app.
+            text = postprocess_text(
+                text,
+                language=self._effective_language(info),
+                vocab=load_vocabulary(),
+                remove_hesitations=bool(self.config.get("remove_hesitations", True)),
+            )
 
             if not text:
                 # Aucun texte reconnu. En dictée éclair on reste silencieux (rien à
@@ -2734,6 +3003,7 @@ class VoixFlashApp(rumps.App):
         forced_lang = None                  # langue figée après le 1er bloc
         timestamps = bool(self.config.get("meeting_timestamps"))
         beam = int(self.config.get("beam_size", 5))
+        vocab = load_vocabulary()           # lu une fois : un import peut durer longtemps
         sep = "\n" if timestamps else " "   # défini AVANT la boucle : réutilisé même en cas
         cancelled = False                   # d'exception (sauvetage des blocs déjà faits)
         try:
@@ -2756,6 +3026,7 @@ class VoixFlashApp(rumps.App):
                     beam_size=beam,
                     vad_filter=True,
                     condition_on_previous_text=False,
+                    initial_prompt=STYLE_PROMPTS.get(forced_lang),
                 )
                 seglist = list(segments)
                 if forced_lang is None and getattr(info, "language", None):
@@ -2771,6 +3042,11 @@ class VoixFlashApp(rumps.App):
 
                 if is_probably_hallucination(block):
                     block = ""              # bloc parasite (silence) : ignoré, pas tout le texte
+                if block:
+                    block = postprocess_text(
+                        block, language=forced_lang or "",
+                        vocab=vocab,
+                        remove_hesitations=bool(self.config.get("remove_hesitations", True)))
                 if block:
                     pieces.append(block)
                     # Sauvegarde partielle : protège le travail déjà fait en cas de
@@ -2852,6 +3128,81 @@ class VoixFlashApp(rumps.App):
         self.config["restore_clipboard"] = not self.config["restore_clipboard"]
         sender.state = self.config["restore_clipboard"]
         save_json(CONFIG_PATH, self.config)
+
+    # ------------------------------------------------ vocabulaire (menu « Texte dicté ») --
+    def toggle_hesitations(self, sender):
+        self.config["remove_hesitations"] = not self.config.get("remove_hesitations", True)
+        sender.state = self.config["remove_hesitations"]
+        save_json(CONFIG_PATH, self.config)
+
+    def _vocab_prompt(self, title, message, placeholder=""):
+        """Petite fenêtre de saisie. Renvoie le texte saisi, ou None si annulé."""
+        try:
+            app_to_front()
+            win = rumps.Window(title=title, message=message, ok="Ajouter",
+                               cancel="Annuler", default_text=placeholder,
+                               dimensions=(300, 22))
+            resp = win.run()
+        except Exception as e:
+            log(f"saisie vocabulaire : {e}")
+            return None
+        if resp.clicked != 1:
+            return None
+        value = (resp.text or "").strip()
+        return value or None
+
+    @staticmethod
+    def _vocab_save(vocab):
+        save_json(VOCAB_PATH, {"mots": vocab.get("mots", []),
+                               "corrections": vocab.get("corrections", {})})
+
+    def vocab_add_word(self, _sender):
+        """Ajoute un mot dont l'orthographe doit être respectée (nom propre, jargon).
+
+        Les variantes proches produites par Whisper seront ramenées sur cette
+        orthographe, y compris quand il découpe le mot en deux ou trois morceaux."""
+        word = self._vocab_prompt(
+            "Ajouter un mot au vocabulaire",
+            "Écris le mot exactement comme tu veux le voir apparaître (nom propre, "
+            "marque, terme métier).\n\nExemple : VoixFlash, Kubernetes, Grob.\n\n"
+            "Les variantes approchantes seront corrigées automatiquement.")
+        if not word:
+            return
+        vocab = load_vocabulary()
+        if word in vocab["mots"]:
+            self._show_info("Déjà présent", f"« {word} » est déjà dans le vocabulaire.")
+            return
+        vocab["mots"].append(word)
+        self._vocab_save(vocab)
+        self._show_info("Vocabulaire mis à jour",
+                        f"« {word} » sera désormais respecté dans les transcriptions.")
+
+    def vocab_add_correction(self, _sender):
+        """Ajoute un remplacement exact : ce que Whisper écrit → ce qu'il faut écrire."""
+        wrong = self._vocab_prompt(
+            "Corriger une faute récurrente (1/2)",
+            "Écris le texte tel que VoixFlash le transcrit AUJOURD'HUI, "
+            "c'est-à-dire la version fautive.\n\nExemple : aye pee aye")
+        if not wrong:
+            return
+        right = self._vocab_prompt(
+            "Corriger une faute récurrente (2/2)",
+            f"Par quoi remplacer « {wrong} » ?\n\nExemple : API\n\n"
+            "Tu peux aussi t'en servir comme raccourci de saisie : une phrase "
+            "courte qui se transforme en un texte plus long.")
+        if right is None:
+            return
+        vocab = load_vocabulary()
+        vocab["corrections"][wrong] = right
+        self._vocab_save(vocab)
+        self._show_info("Correction enregistrée",
+                        f"« {wrong} » deviendra « {right} ».")
+
+    def vocab_open_file(self, _sender):
+        """Ouvre vocabulaire.json pour une édition en masse."""
+        if not os.path.exists(VOCAB_PATH):
+            self._vocab_save(load_vocabulary())
+        self._run(["/usr/bin/open", "-t", VOCAB_PATH], timeout=10)
 
     # ---------------------------------------------- séparation des locuteurs (menu) --
     def _refresh_diar_menu(self):
@@ -3194,6 +3545,7 @@ class VoixFlashApp(rumps.App):
         lang = {"fr": "Français", "en": "Anglais", "auto": "Automatique"}.get(
             self.config.get("language", "fr"), "Français")
         ts_state = "activé" if self.config.get("meeting_timestamps") else "désactivé"
+        hesit_state = "activé" if self.config.get("remove_hesitations", True) else "désactivé"
 
         guide = (
             f"VOIXFLASH {APP_VERSION} — MODE D'EMPLOI COMPLET\n"
@@ -3337,6 +3689,17 @@ class VoixFlashApp(rumps.App):
             f"  F5) OU « Choisir ma touche… » qui capte la touche que TU presses (le plus\n"
             f"  fiable, quel que soit le clavier). Actuel : {hk}. Effet immédiat.\n"
             f"• Réunions › Horodatage des passages : ajoute [mm:ss]. Actuel : {ts_state}.\n"
+            "• Texte dicté › Ajouter un mot au vocabulaire… : écris un nom propre, une\n"
+            "  marque ou un terme métier tel que tu veux le voir. Les variantes proches\n"
+            "  seront corrigées, même quand le moteur découpe le mot (« voie flash »\n"
+            "  devient « VoixFlash »). C'est LE réglage qui change tout sur les noms.\n"
+            "• Texte dicté › Corriger une faute récurrente… : remplacement exact, de la\n"
+            "  version fautive vers la bonne. Sert aussi de raccourci de saisie : une\n"
+            "  phrase courte qui se transforme en un texte plus long (signature, adresse).\n"
+            "• Texte dicté › Ouvrir le fichier de vocabulaire… : édition en masse.\n"
+            "  Toute modification prend effet à la dictée suivante, sans redémarrage.\n"
+            f"• Texte dicté › Retirer les hésitations : efface les « euh » et « hmm ».\n"
+            f"  Actuel : {hesit_state}.\n"
             "\n"
             "━━━ 7. AUTORISATIONS (à faire une seule fois) ━━━\n"
             "\n"
