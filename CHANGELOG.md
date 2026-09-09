@@ -22,6 +22,15 @@
 - **L'icône ne reste plus bloquée.** Si la libération du micro échouait pendant une
   annulation, l'indicateur restait figé sur « enregistrement » alors que l'app ne faisait
   plus rien.
+- **La touche de dictée survit à la veille.** macOS coupe l'écoute du clavier pendant que le
+  Mac dort, sans tuer le mécanisme qui la porte : le garde-fou existant ne voyait donc rien,
+  et la touche restait muette jusqu'au redémarrage de l'app. C'était le scénario « mon Mac a
+  dormi cette nuit, ce matin la dictée ne marche plus ». L'écoute est maintenant réarmée au
+  réveil, et jamais pendant un enregistrement en cours.
+- **Nouveau diagnostic** dans « Aide & autorisations › La touche de dictée ne répond plus ? ».
+  Il distingue les trois causes qui se ressemblent de l'extérieur : autorisation manquante,
+  écoute arrêtée, et **saisie sécurisée** (un champ mot de passe ouvert quelque part suffit à
+  ce que macOS cesse de transmettre les touches). Il réarme l'écoute au passage.
 
 > Mesuré sur cette machine : le micro délivre son premier son 94 ms après l'ouverture. La
 > préparation du micro à l'avance, envisagée après l'étude des outils concurrents (qui

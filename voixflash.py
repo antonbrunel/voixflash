@@ -506,6 +506,51 @@ def input_is_bluetooth():
     return any(m in name for m in ("airpods", "bluetooth", "hands-free", "headset", "beats"))
 
 
+def secure_input_enabled():
+    """True si un processus a activé la « saisie sécurisée » (champ mot de passe…).
+
+    Dans cet état, macOS cesse de livrer les APPUIS de touches aux applications
+    tierces mais continue de livrer les changements de modificateurs. Conséquence
+    déroutante : une touche de dictée modificatrice (Option) marche encore, tandis
+    qu'un raccourci contenant une vraie touche (F5) devient totalement muet, sans
+    le moindre message. C'est la première chose à regarder quand la dictée « ne
+    répond plus ». Renvoie None si l'information n'est pas récupérable."""
+    try:
+        import ctypes
+        lib = ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/Carbon.framework/Carbon")
+        lib.IsSecureEventInputEnabled.restype = ctypes.c_bool
+        lib.IsSecureEventInputEnabled.argtypes = []
+        return bool(lib.IsSecureEventInputEnabled())
+    except Exception as e:
+        log(f"saisie sécurisée (lecture) : {e}")
+        return None
+
+
+try:
+    import objc
+    from AppKit import NSObject as _NSObject
+
+    class WakeObserver(_NSObject):
+        """Reçoit la notification de réveil du Mac et la transmet à l'application."""
+
+        def initWithCallback_(self, callback):
+            self = objc.super(WakeObserver, self).init()
+            if self is None:
+                return None
+            self._callback = callback
+            return self
+
+        def onWake_(self, _notification):
+            try:
+                self._callback()
+            except Exception as e:
+                log(f"réveil : {e}")
+except Exception as _e:                      # pyobjc absent ou trop ancien
+    log(f"observateur de réveil indisponible : {_e}")
+    WakeObserver = None
+
+
 class Sounds:
     """Retours sonores, lecteurs préparés une fois pour toutes.
 
@@ -1387,6 +1432,8 @@ class VoixFlashApp(rumps.App):
         self._ptt_started = None          # instant d'appui (mesure des appuis trop brefs)
         self._capturing = False           # en train de capturer une nouvelle touche ?
         self._sounds = Sounds()           # lecteurs préparés une fois pour toutes
+        self._wake_observer = None        # abonnement au réveil du Mac
+        self._need_rearm = False          # réarmement de l'écoute à faire dès que possible
         self._captured = None             # dernière touche captée pendant la capture
         self._stream = None               # flux audio en cours
         self._frames = []                 # morceaux audio enregistrés
@@ -1430,6 +1477,7 @@ class VoixFlashApp(rumps.App):
 
         # Écoute clavier globale pour la dictée éclair.
         self._start_listener()
+        self._install_wake_observer()
 
         # Garde-fous de sécurité sur un thread DÉDIÉ (et non plus sur le minuteur d'UI).
         # Raison : une fenêtre modale (alerte, fenêtre de réunion) fige le thread
@@ -1541,6 +1589,8 @@ class VoixFlashApp(rumps.App):
 
         # Sous-menu d'aide : guide complet en tête, puis liens vers les réglages macOS.
         self.help_menu.add(rumps.MenuItem("Mode d'emploi complet", callback=self.show_guide))
+        self.help_menu.add(rumps.MenuItem("La touche de dictée ne répond plus ?",
+                                          callback=self.diagnose_hotkey))
         self.help_menu.add(rumps.MenuItem("Voir le chemin à autoriser", callback=self.show_path))
         self.help_menu.add(rumps.MenuItem("Ouvrir réglages › Microphone", callback=self.open_mic_settings))
         self.help_menu.add(rumps.MenuItem("Ouvrir réglages › Accessibilité", callback=self.open_acc_settings))
@@ -1954,6 +2004,48 @@ class VoixFlashApp(rumps.App):
                 self._ui_queue.put(("state", "idle"))
 
     # --------------------------------------------------------- écoute clavier --
+    def _install_wake_observer(self):
+        """S'abonne au réveil du Mac pour réarmer l'écoute clavier (cf. _on_wake)."""
+        if WakeObserver is None:
+            return
+        try:
+            from AppKit import NSWorkspace
+            self._wake_observer = WakeObserver.alloc().initWithCallback_(self._on_wake)
+            NSWorkspace.sharedWorkspace().notificationCenter(
+            ).addObserver_selector_name_object_(
+                self._wake_observer, b"onWake:", "NSWorkspaceDidWakeNotification", None)
+            log("Réarmement au réveil : observateur installé.")
+        except Exception as e:
+            log(f"observateur de réveil : {e}")
+
+    def _on_wake(self):
+        """Réarme l'écoute clavier quand le Mac sort de veille.
+
+        macOS invalide la prise d'événements clavier pendant la veille, MAIS le
+        thread d'écoute reste vivant : le garde-fou qui surveille sa mort ne voit
+        donc rien, et la touche de dictée reste muette jusqu'au prochain
+        redémarrage de l'app. C'est le scénario « mon Mac a dormi cette nuit et ce
+        matin la dictée ne marche plus ».
+
+        Le réarmement ne doit JAMAIS démarrer ni arrêter un enregistrement : s'il y
+        en a un en cours, on se contente de noter qu'il faudra réarmer plus tard."""
+        if self._recording or self._ptt_active:
+            self._need_rearm = True
+            return
+        # Court délai : au retour de veille, les services système ne sont pas
+        # encore tous revenus, et un réarmement immédiat retombe sur une prise
+        # d'événements tout aussi morte.
+        threading.Timer(1.0, self._rearm_listener, args=("réveil du Mac",)).start()
+
+    def _rearm_listener(self, reason):
+        """Recrée l'écoute clavier. Sûr hors du thread principal."""
+        try:
+            self._need_rearm = False
+            log(f"Réarmement de l'écoute clavier ({reason}).")
+            self._start_listener()
+        except Exception as e:
+            log(f"réarmement de l'écoute : {e}")
+
     def _start_listener(self):
         """(Re)démarre l'écoute clavier globale pour la dictée éclair."""
         if self._listener is not None:
@@ -2934,6 +3026,13 @@ class VoixFlashApp(rumps.App):
                     self._last_listener_restart = now
                     log("Écoute clavier interrompue : relance automatique.")
                     self._start_listener()
+        except Exception:
+            pass
+        # 1 bis) Réarmement demandé pendant un enregistrement (réveil du Mac) : on
+        #        attend que le micro soit libre pour ne rien interrompre.
+        try:
+            if self._need_rearm and not self._recording and not self._ptt_active:
+                self._rearm_listener("réveil différé")
         except Exception:
             pass
         # 2) Arrêter un enregistrement anormalement long (micro oublié, mémoire).
@@ -3988,6 +4087,13 @@ class VoixFlashApp(rumps.App):
             "Puis clique « Redémarrer VoixFlash ». Tant que « Surveillance des entrées »\n"
             "n'est pas accordée, la touche de dictée reste sans effet (et sans message).\n"
             "\n"
+            "Si la touche cesse de répondre APRÈS avoir fonctionné, utilise « Aide &\n"
+            "autorisations › La touche de dictée ne répond plus ? ». Il distingue les\n"
+            "trois causes qui se ressemblent de l'extérieur : autorisation perdue,\n"
+            "écoute arrêtée, et saisie sécurisée (un champ mot de passe ouvert quelque\n"
+            "part suffit à ce que macOS cesse de transmettre les touches). Indice :\n"
+            "si Option marche encore mais que F5 ne fait rien, c'est ce dernier cas.\n"
+            "\n"
             "━━━ 8. HORS-LIGNE & VIE PRIVÉE ━━━\n"
             "\n"
             "Après l'installation, tout fonctionne SANS internet : ta voix ne quitte\n"
@@ -4010,6 +4116,55 @@ class VoixFlashApp(rumps.App):
             win.run()
         except Exception as e:
             log(f"fenêtre guide : {e}")
+
+    def diagnose_hotkey(self, _sender):
+        """Explique pourquoi la touche de dictée reste muette, et répare ce qui peut l'être.
+
+        Les trois causes réelles se ressemblent de l'extérieur (« rien ne se passe »)
+        mais se distinguent très bien de l'intérieur, d'où ce point unique."""
+        acc = accessibility_trusted()
+        alive = bool(self._listener is not None and self._listener.is_alive())
+        secure = secure_input_enabled()
+        modifier = hotkey_is_modifier(self._hotkey)
+        lignes = [
+            f"Touche actuelle : {self._current_hotkey_label()}"
+            f" ({'modificateur' if modifier else 'touche ordinaire'})",
+            f"Écoute clavier active : {'oui' if alive else 'NON'}",
+            f"Autorisation « Accessibilité » : {'accordée' if acc else 'MANQUANTE'}",
+            f"Saisie sécurisée en cours : "
+            f"{'inconnue' if secure is None else ('OUI' if secure else 'non')}",
+            "",
+        ]
+        if secure:
+            lignes += [
+                "→ Une application a activé la SAISIE SÉCURISÉE (champ mot de passe "
+                "ouvert, ou « saisie sécurisée » cochée dans le Terminal). Tant qu'elle "
+                "est active, macOS n'envoie plus les appuis de touches à VoixFlash.",
+                "",
+                "Ferme le champ mot de passe, ou décoche Terminal › menu Terminal › "
+                "« Saisie sécurisée ». Si le problème persiste, ferme puis rouvre "
+                "l'application où tu tapais un mot de passe.",
+            ]
+        elif not acc:
+            lignes += ["→ Autorise « Accessibilité » (bouton de ce menu), puis "
+                       "« Redémarrer VoixFlash »."]
+        elif not alive:
+            lignes += ["→ L'écoute clavier s'est arrêtée. Elle vient d'être relancée."]
+        else:
+            lignes += [
+                "→ Tout paraît normal de ce côté. Si la touche reste muette, c'est "
+                "presque toujours l'autorisation « Surveillance des entrées » qui a "
+                "expiré (elle le fait après une veille ou une mise à jour).",
+                "",
+                "Indice utile : si un raccourci fait d'un simple modificateur (Option) "
+                "fonctionne alors qu'une touche ordinaire (F5) ne fait rien, c'est "
+                "exactement ce cas.",
+                "",
+                "L'écoute vient d'être réarmée : réessaie tout de suite.",
+            ]
+        if not secure and acc:
+            self._rearm_listener("diagnostic manuel")
+        self._show_info("Diagnostic de la touche de dictée", "\n".join(lignes))
 
     def show_path(self, _sender):
         # On affiche le chemin STABLE du lanceur (celui que launchd utilise), pas le
