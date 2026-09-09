@@ -23,11 +23,19 @@ import sys
 import json
 import time
 import queue
+import socket
 import sqlite3
 import contextlib
 import threading
 import subprocess
 import datetime
+
+# Délais maximaux des appels réseau de Hugging Face. À poser AVANT d'importer
+# faster_whisper : huggingface_hub lit ces variables au moment de son import. Sans
+# elles, un CDN qui ne répond pas (portail captif, VPN, route IPv6 morte) laisse
+# l'app coincée sur « chargement » indéfiniment, sans le moindre message.
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "20")
+os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "10")
 
 import numpy as np
 import sounddevice as sd
@@ -66,12 +74,23 @@ try:
 except Exception:
     AppHelper = None
 
+# Boucle d'événements macOS. Sert à deux choses (cf. _install_timer_common_modes et
+# _runloop_is_idle) : faire battre le minuteur d'interface même quand un menu est
+# déroulé ou qu'une fenêtre est ouverte, et savoir dans quel mode on se trouve pour
+# ne jamais reconstruire un menu pendant que l'utilisateur le parcourt.
+try:
+    from Foundation import NSRunLoop, NSDefaultRunLoopMode, NSRunLoopCommonModes
+except Exception:
+    NSRunLoop = None
+    NSDefaultRunLoopMode = None
+    NSRunLoopCommonModes = None
+
 
 # --------------------------------------------------------------------------- #
 #  Chemins & constantes
 # --------------------------------------------------------------------------- #
 APP_NAME = "VoixFlash"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 LAUNCHD_LABEL = "com.voixflash.agent"   # étiquette du LaunchAgent (cf. install.command)
 APP_HOME = os.path.expanduser(f"~/Library/Application Support/{APP_NAME}")
 CONFIG_PATH = os.path.join(APP_HOME, "config.json")
@@ -85,6 +104,20 @@ HISTORY_KEEP = 1000   # nombre max d'entrées conservées (purge auto des plus a
 _FTS_AVAILABLE = False
 LOG_PATH = os.path.join(APP_HOME, "voixflash.log")
 TRANSCRIPTS_DIR = os.path.expanduser(f"~/Documents/{APP_NAME} Transcriptions")
+
+# Filet de sécurité des réunions : pendant TOUT l'enregistrement, l'audio est aussi
+# écrit sur le disque, au fil de l'eau, dans ce dossier (PCM 16 bits mono brut + une
+# petite fiche .json qui décrit le fichier). Si l'app est forcée à quitter, plante,
+# ou que le Mac s'éteint, l'enregistrement n'est PAS perdu : il est retrouvé et
+# proposé à la transcription au démarrage suivant (cf. _check_interrupted_meetings).
+MEETING_RAW_DIR = os.path.join(APP_HOME, "reunions_interrompues")
+MEETING_RAW_PREFIX = "reunion_"
+
+# Au-delà de ce nombre de caractères, une transcription n'est plus affichée dans une
+# fenêtre : le champ de saisie de rumps est un NSTextField simple (sans défilement),
+# dont la mise en page rame très fort sur un long texte et fige le thread principal.
+# On passe alors par un fichier .txt ouvert dans TextEdit.
+LONG_TEXT_CHARS = 4000
 
 # --- Séparation des locuteurs (diarisation) — module OPTIONNEL, installé à la demande -
 # Moteur : sherpa-onnx (onnxruntime, hors-ligne). Les modèles ONNX sont hébergés sur les
@@ -136,6 +169,7 @@ CPU_THREADS = max(1, (os.cpu_count() or 4) - 2)
 
 os.makedirs(APP_HOME, exist_ok=True)
 os.makedirs(TRANSCRIPTS_DIR, exist_ok=True)
+os.makedirs(MEETING_RAW_DIR, exist_ok=True)
 
 # Réglages par défaut (modifiables depuis le menu, sauvegardés dans config.json).
 DEFAULT_CONFIG = {
@@ -166,6 +200,10 @@ STATE_SYMBOLS = {
 # Libellés du menu réunion (sans emoji : ils dénotaient dans un menu macOS natif).
 MEETING_START_TITLE = "Démarrer une réunion"
 MEETING_STOP_TITLE = "Arrêter la réunion"
+# Pendant la transcription d'une réunion, l'item affiche la progression et sert de
+# bouton d'annulation : une transcription d'1 h prend plusieurs minutes, et sans
+# aucun retour à l'écran on ne distingue pas « ça travaille » de « c'est planté ».
+MEETING_TRANSCRIBE_TITLE = "Transcription en cours…"
 
 # Libellés de l'item « Importer un fichier audio » (qui bascule en « Annuler » pendant
 # qu'un import est en cours de transcription).
@@ -491,6 +529,80 @@ def accessibility_trusted():
         except Exception:
             continue
     return True
+
+
+def app_to_front():
+    """Passe VoixFlash au premier plan.
+
+    ⚠ À appeler AVANT toute fenêtre modale (alerte, fenêtre de saisie, sélecteur de
+    fichier). VoixFlash est une application « accessoire » : elle n'est jamais l'app
+    active. Une NSAlert ouverte dans cet état apparaît DERRIÈRE la fenêtre dans
+    laquelle on travaille — invisible — alors que son runModal() bloque le thread
+    principal jusqu'au clic. L'app semble alors totalement gelée (icône figée, menu
+    qui ne s'ouvre plus) et la seule issue est de forcer la fermeture. C'était la
+    cause n°1 des blocages signalés."""
+    if NSApplication is None:
+        return
+    try:
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+    except Exception as e:
+        log(f"activation au premier plan : {e}")
+
+
+def internet_reachable(host="huggingface.co", port=443, timeout=5.0):
+    """True si l'hôte répond en moins de `timeout` secondes.
+
+    Sert de garde-fou AVANT le seul appel réseau bloquant de l'app (téléchargement
+    d'un modèle absent du cache) : mieux vaut un message clair en 5 s qu'une app
+    coincée sur « chargement » pour toujours."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception as e:
+        log(f"réseau injoignable ({host}:{port}) : {e}")
+        return False
+
+
+# ---------------------------------------------- filet de sécurité des réunions --
+def meeting_backup_paths(stamp):
+    """Couple (fichier audio brut, fiche descriptive) d'une sauvegarde de réunion."""
+    base = os.path.join(MEETING_RAW_DIR, f"{MEETING_RAW_PREFIX}{stamp}")
+    return base + ".raw", base + ".json"
+
+
+def meeting_backup_duration(raw_path, sr):
+    """Durée (s) d'une sauvegarde brute, déduite de sa taille (PCM 16 bits mono)."""
+    try:
+        return os.path.getsize(raw_path) / (2.0 * max(1, int(sr)))
+    except OSError:
+        return 0.0
+
+
+def find_interrupted_meetings():
+    """Liste les sauvegardes de réunions restées sur le disque (donc jamais transcrites),
+    de la plus ancienne à la plus récente. Chaque élément : (raw, json, sr, durée)."""
+    found = []
+    try:
+        names = sorted(os.listdir(MEETING_RAW_DIR))
+    except OSError:
+        return found
+    for name in names:
+        if not (name.startswith(MEETING_RAW_PREFIX) and name.endswith(".raw")):
+            continue
+        raw = os.path.join(MEETING_RAW_DIR, name)
+        meta_path = raw[:-4] + ".json"
+        meta = load_json(meta_path, {})
+        sr = int(meta.get("sr") or 16000)
+        dur = meeting_backup_duration(raw, sr)
+        if dur < 1.0:          # moins d'une seconde : rien d'exploitable, on nettoie
+            for p in (raw, meta_path):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            continue
+        found.append((raw, meta_path, sr, dur))
+    return found
 
 
 # --------------------------------------------------------------------------- #
@@ -885,6 +997,8 @@ class VoixFlashApp(rumps.App):
         self._transcribing = False
         self._importing = False           # un import de FICHIER est-il en cours ? (≠ réunion)
         self._import_cancel = False       # demande d'annulation de l'import en cours
+        self._transcribing_meeting = False  # la transcription en cours est-elle une RÉUNION ?
+        self._transcribe_cancel = False   # demande d'annulation de la transcription de réunion
         self._record_mode = None          # "flash" ou "meeting"
         self._ptt_active = False          # touche de dictée actuellement maintenue ?
         self._capturing = False           # en train de capturer une nouvelle touche ?
@@ -895,6 +1009,11 @@ class VoixFlashApp(rumps.App):
         self._record_start = None         # début de l'enregistrement (garde-fou durée)
         self._last_listener_restart = 0.0  # anti-rafale pour la relance de l'écoute
         self._ui_queue = queue.Queue()    # messages des threads de fond vers l'UI
+        self._deferred = []               # messages d'UI en attente d'un moment sûr
+        # Sauvegarde disque de la réunion en cours (cf. _start_disk_backup).
+        self._disk_queue = None           # file d'écriture (audio → thread d'écriture)
+        self._disk_thread = None          # thread qui écrit le fichier brut
+        self._disk_paths = None           # (raw, json) de la sauvegarde en cours
         self._lock = threading.Lock()
         self._hotkey = parse_hotkey(self.config["hotkey"])
         self._listener = None
@@ -907,6 +1026,7 @@ class VoixFlashApp(rumps.App):
         # 0,15 s = indicateur réactif, et coût processeur négligeable au repos.
         self._timer = rumps.Timer(self._drain_ui, 0.15)
         self._timer.start()
+        self._install_timer_common_modes()
 
         # Chargement du modèle en arrière-plan → démarrage instantané de l'app.
         threading.Thread(target=self._load_model, daemon=True).start()
@@ -933,6 +1053,15 @@ class VoixFlashApp(rumps.App):
         # Au tout premier lancement, on affiche l'aide sur les autorisations.
         if first_run:
             self._ui_queue.put(("welcome", None))
+
+        # Une réunion a-t-elle été interrompue (fermeture forcée, plante, coupure) ?
+        # Son audio est sur le disque : on propose de la transcrire maintenant.
+        interrupted = find_interrupted_meetings()
+        if interrupted:
+            log(f"{len(interrupted)} réunion(s) interrompue(s) retrouvée(s) sur le disque.")
+            self._ui_queue.put(("recover_meeting", interrupted))
+
+        log(f"{APP_NAME} {APP_VERSION} démarré (modèle demandé : {self._requested_model}).")
 
     # ----------------------------------------------------------------- menu --
     def _build_menu(self):
@@ -1160,24 +1289,19 @@ class VoixFlashApp(rumps.App):
         entrées » n'est pas autorisée → on le diagnostique et on propose de l'ouvrir."""
         self._captured = None
         self._capturing = True
-        try:
-            validated = rumps.alert(
-                title="Choisir la touche de dictée",
-                message="Appuie MAINTENANT sur la touche que tu veux utiliser pour la "
-                        "dictée éclair (idéalement une touche de fonction comme F6, ou un "
-                        "modificateur comme Option), puis clique « Valider » à la souris.\n\n"
-                        "Astuce : évite une lettre normale — tu l'écrirais en dictant.",
-                ok="Valider", cancel="Annuler",
-            )
-        except Exception as e:
-            log(f"capture touche : {e}")
-            self._capturing = False
-            return
+        validated = self._modal_alert(
+            title="Choisir la touche de dictée",
+            message="Appuie MAINTENANT sur la touche que tu veux utiliser pour la "
+                    "dictée éclair (idéalement une touche de fonction comme F6, ou un "
+                    "modificateur comme Option), puis clique « Valider » à la souris.\n\n"
+                    "Astuce : évite une lettre normale — tu l'écrirais en dictant.",
+            ok="Valider", cancel="Annuler",
+        )
         self._capturing = False
         key = self._captured
         self._captured = None
 
-        if not validated:                 # Annuler
+        if validated != 1:                # Annuler
             return
         if key is None:
             # Aucune touche reçue : très probablement « Surveillance des entrées » non
@@ -1251,6 +1375,7 @@ class VoixFlashApp(rumps.App):
         transcription). Callback de menu → thread principal : la fenêtre modale est
         légitime ici (comme rumps.alert / le sélecteur de fichier)."""
         try:
+            app_to_front()
             win = rumps.Window(
                 title="Rechercher dans l'historique",
                 message="Tape un ou plusieurs mots-clés, puis « Chercher ».\n"
@@ -1379,7 +1504,16 @@ class VoixFlashApp(rumps.App):
             except Exception as cache_miss:
                 # Modèle pas encore téléchargé (tout premier usage de cette qualité) :
                 # on autorise alors le téléchargement réseau, une seule fois.
+                # ⚠ On vérifie D'ABORD que le réseau répond. Sans ce contrôle, une
+                # connexion qui pend (portail captif, VPN, route IPv6 morte) laissait
+                # l'app coincée sur « chargement » indéfiniment, sans message.
                 log(f"Modèle « {name} » absent du cache ({cache_miss}) — téléchargement…")
+                if not internet_reachable():
+                    raise RuntimeError(
+                        "le modèle n'est pas encore téléchargé et internet ne répond "
+                        "pas. Connecte-toi, puis choisis « Redémarrer VoixFlash ». "
+                        "Astuce : une qualité déjà téléchargée reste utilisable "
+                        "hors-ligne (menu « Qualité / vitesse »)")
                 model = WhisperModel(name, device="cpu", compute_type="int8",
                                      cpu_threads=CPU_THREADS)
                 log(f"Modèle téléchargé puis chargé : {name}")
@@ -1463,7 +1597,98 @@ class VoixFlashApp(rumps.App):
             log(f"_on_release : {e}")
             self._ptt_active = False
 
+    # -------------------------------------- sauvegarde disque d'une réunion --
+    def _start_disk_backup(self, sr):
+        """Ouvre la sauvegarde au fil de l'eau d'une réunion (PCM 16 bits mono brut).
+
+        L'écriture se fait dans un thread DÉDIÉ, alimenté par une file : le callback
+        audio de PortAudio tourne sur un thread temps réel, où une écriture disque
+        bloquante provoquerait des trous dans l'enregistrement."""
+        try:
+            stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            raw_path, meta_path = meeting_backup_paths(stamp)
+            save_json(meta_path, {"sr": int(sr), "started": stamp, "version": APP_VERSION})
+            q = queue.Queue()
+            t = threading.Thread(target=self._disk_writer_loop, args=(raw_path, q), daemon=True)
+            self._disk_queue = q
+            self._disk_thread = t
+            self._disk_paths = (raw_path, meta_path)
+            t.start()
+            log(f"Sauvegarde de réunion ouverte : {os.path.basename(raw_path)} ({sr} Hz)")
+        except Exception as e:
+            # Une sauvegarde impossible ne doit JAMAIS empêcher d'enregistrer.
+            log(f"ouverture de la sauvegarde de réunion : {e}")
+            self._disk_queue = self._disk_thread = self._disk_paths = None
+
+    @staticmethod
+    def _disk_writer_loop(raw_path, q):
+        """Écrit les blocs audio au fil de l'eau jusqu'au message de fin (None)."""
+        try:
+            with open(raw_path, "wb") as f:
+                pending = 0
+                while True:
+                    item = q.get()
+                    if item is None:
+                        break
+                    f.write(item)
+                    pending += len(item)
+                    # Vidage régulier (~1 Mo) : en cas de coupure de courant, on ne
+                    # perd au pire que la dernière poignée de secondes.
+                    if pending >= 1 << 20:
+                        f.flush()
+                        os.fsync(f.fileno())
+                        pending = 0
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception as e:
+            log(f"écriture de la sauvegarde de réunion : {e}")
+
+    def _stop_disk_backup(self):
+        """Ferme proprement la sauvegarde en cours et renvoie ses chemins (ou None)."""
+        q, t, paths = self._disk_queue, self._disk_thread, self._disk_paths
+        self._disk_queue = self._disk_thread = self._disk_paths = None
+        if q is None:
+            return None
+        try:
+            q.put(None)
+            if t is not None:
+                t.join(timeout=10.0)
+        except Exception as e:
+            log(f"fermeture de la sauvegarde de réunion : {e}")
+        return paths
+
+    @staticmethod
+    def _discard_disk_backup(paths):
+        """Efface une sauvegarde devenue inutile (texte bien enregistré en historique)."""
+        if not paths:
+            return
+        for p in paths:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
     # ------------------------------------------------------------ audio I/O --
+    def _make_audio_cb(self, sink, disk_queue):
+        """Fabrique le callback audio d'UN flux précis.
+
+        Le callback écrit dans la liste `sink` qui lui est propre, et non dans
+        self._frames : si un ancien flux n'est pas encore complètement arrêté quand un
+        nouvel enregistrement démarre, ses derniers blocs ne peuvent plus polluer le
+        nouvel enregistrement."""
+        def cb(indata, _frames, _time_info, status):
+            if status:
+                log(f"audio status: {status}")
+            # Copie nécessaire : le tampon est réutilisé par PortAudio.
+            buf = indata.copy()
+            sink.append(buf)
+            if disk_queue is not None:
+                try:
+                    disk_queue.put_nowait(buf.tobytes())
+                except Exception:
+                    pass          # jamais d'exception dans un callback temps réel
+        return cb
+
     def _start_recording(self, mode):
         """Démarre l'enregistrement. Renvoie True si le micro s'est bien ouvert."""
         with self._lock:
@@ -1471,7 +1696,8 @@ class VoixFlashApp(rumps.App):
                 return False
             self._recording = True
             self._record_mode = mode
-            self._frames = []
+            frames = []
+            self._frames = frames
             self._record_start = time.monotonic()
         self._ui_queue.put(("state", "recording"))
         # On enregistre en int16 (PCM standard, 2 octets/échantillon) : moitié moins
@@ -1479,11 +1705,18 @@ class VoixFlashApp(rumps.App):
         # float32 [-1, 1] attendu par Whisper se fait une seule fois à l'arrêt.
         # On tente 16 kHz directement (CoreAudio convertit proprement) ; en cas
         # d'échec, on enregistre à la fréquence du micro puis on rééchantillonne.
+        # Filet de sécurité : seules les RÉUNIONS sont sauvegardées au fil de l'eau
+        # (une dictée éclair dure quelques secondes, il n'y a rien à sauver).
+        disk_q = None
+        if mode == "meeting":
+            self._start_disk_backup(16000)
+            disk_q = self._disk_queue
         try:
             self._record_sr = 16000
-            self._stream = sd.InputStream(samplerate=16000, channels=1,
-                                          dtype="int16", callback=self._audio_cb)
+            self._stream = sd.InputStream(samplerate=16000, channels=1, dtype="int16",
+                                          callback=self._make_audio_cb(frames, disk_q))
             self._stream.start()
+            log(f"Enregistrement démarré ({mode}, 16000 Hz).")
             return True
         except Exception as e:
             log(f"16 kHz indisponible ({e}) — repli sur la fréquence par défaut du micro.")
@@ -1501,13 +1734,23 @@ class VoixFlashApp(rumps.App):
                 self._record_sr = int(info["default_samplerate"])
             except Exception:
                 self._record_sr = 48000
+            # La sauvegarde disque a été ouverte en annonçant 16 kHz : on corrige la
+            # fiche, sinon une réunion récupérée serait relue à la mauvaise vitesse.
+            if self._disk_paths is not None:
+                save_json(self._disk_paths[1], {"sr": int(self._record_sr),
+                                                "started": datetime.datetime.now().isoformat(
+                                                    timespec="seconds"),
+                                                "version": APP_VERSION})
             try:
-                self._stream = sd.InputStream(samplerate=self._record_sr, channels=1,
-                                              dtype="int16", callback=self._audio_cb)
+                self._stream = sd.InputStream(
+                    samplerate=self._record_sr, channels=1, dtype="int16",
+                    callback=self._make_audio_cb(frames, disk_q))
                 self._stream.start()
+                log(f"Enregistrement démarré ({mode}, {self._record_sr} Hz, repli).")
                 return True
             except Exception as e2:
                 log(f"Impossible d'ouvrir le micro : {e2}")
+                self._discard_disk_backup(self._stop_disk_backup())
                 with self._lock:
                     self._recording = False
                     self._record_mode = None
@@ -1515,18 +1758,18 @@ class VoixFlashApp(rumps.App):
                 self._ui_queue.put(("state", "idle"))
                 return False
 
-    def _audio_cb(self, indata, frames, time_info, status):
-        if status:
-            log(f"audio status: {status}")
-        # Copie nécessaire : le tampon est réutilisé par PortAudio.
-        self._frames.append(indata.copy())
-
     def _stop_recording(self):
-        # Tout se fait sous le verrou. Le callback audio (_audio_cb) ne prend JAMAIS
-        # le verrou : fermer le flux ici ne peut donc pas créer d'inter-blocage, et
-        # comme stop() attend la fin du callback, on récupère ensuite la totalité des
-        # échantillons sans rien perdre, et sans qu'un nouvel enregistrement puisse
-        # s'intercaler et écraser les buffers.
+        """Arrête l'enregistrement. Retourne IMMÉDIATEMENT.
+
+        ⚠ Cette méthode est appelée depuis un callback de menu, donc sur le thread
+        principal. Tout ce qui peut durer est confié à un thread de fond :
+        • stream.stop() attend la fin des callbacks audio et peut bloquer plusieurs
+          secondes (voire indéfiniment) si le périphérique a changé en cours de route
+          (écouteurs débranchés, veille, micro pris par une autre app) ;
+        • la concaténation des blocs d'une réunion d'une heure recopie des centaines
+          de mégaoctets.
+        Faire ces deux choses ici gelait l'interface — et, comme le verrou était tenu
+        pendant ce temps, même les garde-fous ne pouvaient plus rien sauver."""
         with self._lock:
             if not self._recording:
                 return
@@ -1535,31 +1778,51 @@ class VoixFlashApp(rumps.App):
             # fichier (ou une autre transcription) démarre en parallèle. _process_audio le
             # remettra à False dans son `finally`.
             self._transcribing = True
+            self._transcribing_meeting = (self._record_mode == "meeting")
+            self._transcribe_cancel = False
             mode = self._record_mode
             self._record_mode = None
             self._record_start = None
             stream = self._stream
             self._stream = None
             record_sr = self._record_sr
-            try:
-                if stream is not None:
+            # On garde la MÊME liste que le callback : lui continuera d'y ajouter les
+            # derniers blocs jusqu'à ce que stream.stop() rende la main, et le thread de
+            # fond ne la lira qu'après. Rien n'est perdu. Un futur enregistrement, lui,
+            # repartira sur une liste neuve (créée par _start_recording).
+            frames = self._frames
+            self._frames = []
+        self._ui_queue.put(("state", "transcribing"))
+        threading.Thread(target=self._finalize_recording,
+                         args=(stream, frames, record_sr, mode), daemon=True).start()
+
+    def _finalize_recording(self, stream, frames, record_sr, mode):
+        """Ferme le flux, assemble l'audio, puis lance la transcription. Thread de fond."""
+        try:
+            t0 = time.monotonic()
+            if stream is not None:
+                try:
                     stream.stop()    # attend la fin des callbacks (plus aucun ajout)
                     stream.close()
-            except Exception as e:
-                log(f"fermeture flux : {e}")
-            frames = self._frames    # capturé après stop() : complet
-            self._frames = []
-
-        if frames:
-            # int16 -> float32 normalisé dans [-1, 1], ce qu'attend Whisper.
-            audio = np.concatenate(frames, axis=0).flatten().astype(np.float32) / 32768.0
-        else:
-            audio = np.zeros(0, dtype=np.float32)
-
-        self._ui_queue.put(("state", "transcribing"))
-        # La transcription tourne dans un thread séparé : l'interface ne fige pas.
-        threading.Thread(target=self._process_audio,
-                         args=(audio, record_sr, mode), daemon=True).start()
+                except Exception as e:
+                    log(f"fermeture flux : {e}")
+            backup = self._stop_disk_backup()
+            if frames:
+                # int16 -> float32 normalisé dans [-1, 1], ce qu'attend Whisper.
+                audio = np.concatenate(frames, axis=0).flatten().astype(np.float32) / 32768.0
+            else:
+                audio = np.zeros(0, dtype=np.float32)
+            frames.clear()           # libère la mémoire int16 avant la transcription
+            log(f"Enregistrement arrêté ({mode}) : {len(audio) / max(1, record_sr):.1f} s "
+                f"d'audio, flux fermé en {time.monotonic() - t0:.1f} s.")
+            self._process_audio(audio, record_sr, mode, backup=backup)
+        except Exception as e:
+            log(f"finalisation de l'enregistrement : {e}")
+            self._ui_queue.put(("error", f"Erreur à l'arrêt de l'enregistrement : {e}"))
+            self._ui_queue.put(("state", "idle"))
+            with self._lock:
+                self._transcribing = False
+                self._transcribing_meeting = False
 
     def _resample(self, audio, sr_in, sr_out=16000):
         """Rééchantillonnage simple (interpolation linéaire), utilisé en repli."""
@@ -1573,18 +1836,26 @@ class VoixFlashApp(rumps.App):
         return np.interp(x_new, x_old, audio).astype(np.float32)
 
     # ----------------------------------------------------- transcription --
-    def _process_audio(self, audio, sr, mode):
+    def _process_audio(self, audio, sr, mode, backup=None):
+        """Transcrit l'audio d'une dictée ou d'une réunion. Thread de fond.
+
+        `backup` : chemins de la sauvegarde brute de la réunion, effacée seulement
+        une fois le texte réellement enregistré dans l'historique."""
+        cancelled = False
         try:
             if sr != 16000 and len(audio) > 0:
                 audio = self._resample(audio, sr, 16000)
             if len(audio) < 1600:          # moins de 0,1 s : rien à transcrire
+                self._discard_disk_backup(backup)
                 self._ui_queue.put(("state", "idle"))
                 return
 
             with self._lock:
                 model = self.model
             if model is None:
-                self._ui_queue.put(("error", "Moteur de transcription indisponible."))
+                self._ui_queue.put(("error", "Moteur de transcription indisponible. "
+                                             "L'enregistrement est conservé : il te sera "
+                                             "proposé au prochain démarrage."))
                 self._ui_queue.put(("state", "idle"))
                 return
 
@@ -1596,6 +1867,10 @@ class VoixFlashApp(rumps.App):
             # de transcrire les longs silences. En dictée éclair on parle exprès,
             # donc on le désactive pour ne jamais perdre un mot.
             # condition_on_previous_text=False : évite les répétitions en boucle.
+            t0 = time.monotonic()
+            total = len(audio) / 16000.0
+            log(f"Transcription démarrée ({mode}, {fmt_duration(total)} d'audio, "
+                f"modèle {self.model_name_loaded}).")
             segments, info = model.transcribe(
                 audio,
                 language=whisper_lang,
@@ -1603,7 +1878,17 @@ class VoixFlashApp(rumps.App):
                 vad_filter=(mode == "meeting"),
                 condition_on_previous_text=False,
             )
-            seglist = list(segments)
+            # faster-whisper renvoie un GÉNÉRATEUR : le calcul se fait au fur et à
+            # mesure qu'on le parcourt. On en profite pour afficher une progression
+            # réelle, sauvegarder le texte au fil de l'eau et permettre l'annulation.
+            # Sans ça, une réunion d'une heure laissait l'app muette une dizaine de
+            # minutes — indiscernable d'un plantage, d'où les fermetures forcées.
+            if mode == "meeting":
+                seglist, cancelled = self._collect_meeting_segments(segments, total)
+            else:
+                seglist = list(segments)
+            log(f"Transcription terminée ({mode}) : {len(seglist)} passages en "
+                f"{time.monotonic() - t0:.1f} s{' (annulée)' if cancelled else ''}.")
 
             # Séparation des locuteurs (réunions uniquement, si activée et prête). On tient
             # tout l'audio en mémoire ici, donc les identités de locuteurs sont cohérentes
@@ -1642,9 +1927,16 @@ class VoixFlashApp(rumps.App):
                 # « Arrêter » : il ATTEND un résultat — un retour vide passerait pour
                 # une réunion perdue. On l'informe explicitement.
                 if mode == "meeting":
+                    # On NE supprime PAS l'enregistrement : « aucun texte détecté » peut
+                    # aussi venir d'une mauvaise langue ou d'un micro trop bas. L'audio
+                    # est conservé et reproposé au démarrage suivant, où l'utilisateur
+                    # pourra réessayer (autre qualité, autre langue) ou le supprimer.
+                    garde = (" L'enregistrement est conservé : il te sera reproposé au "
+                             "prochain démarrage, où tu pourras réessayer avec une autre "
+                             "qualité ou une autre langue." if backup else "")
                     self._ui_queue.put(("error", "Réunion terminée, mais aucun texte n'a "
                                                  "été détecté (micro trop faible, trop loin, "
-                                                 "ou silence). Rien n'a été enregistré."))
+                                                 f"ou silence).{garde}"))
                 self._ui_queue.put(("state", "idle"))
                 return
 
@@ -1653,6 +1945,14 @@ class VoixFlashApp(rumps.App):
             # rafraîchir le menu (« history_changed »).
             entry = history_add(mode, text)
             self._ui_queue.put(("history_changed", None))
+            # Le texte est en base : la sauvegarde brute et le brouillon partiel n'ont
+            # plus d'utilité. C'est le SEUL endroit où on les efface.
+            self._discard_disk_backup(backup)
+            self._clear_meeting_partial()
+            if cancelled:
+                self._ui_queue.put(("info", ("Transcription interrompue",
+                                             "La partie déjà transcrite a été enregistrée "
+                                             "dans l'historique.")))
 
             if mode == "flash":
                 # Dictée éclair : on colle le texte là où est le curseur.
@@ -1667,7 +1967,11 @@ class VoixFlashApp(rumps.App):
 
         except Exception as e:
             log(f"Erreur de transcription : {e}")
-            self._ui_queue.put(("error", f"Erreur de transcription : {e}"))
+            # La sauvegarde brute n'est PAS effacée ici : c'est justement le cas où
+            # elle sert. Elle sera reproposée au prochain démarrage.
+            suite = (" L'enregistrement est conservé : il te sera proposé au prochain "
+                     "démarrage." if mode == "meeting" and backup else "")
+            self._ui_queue.put(("error", f"Erreur de transcription : {e}.{suite}"))
             self._ui_queue.put(("state", "idle"))
         finally:
             # Fin de la phase de transcription, quel que soit le chemin (succès, audio
@@ -1675,6 +1979,49 @@ class VoixFlashApp(rumps.App):
             # prochaine dictée/réunion/import.
             with self._lock:
                 self._transcribing = False
+                self._transcribing_meeting = False
+                self._transcribe_cancel = False
+            if mode == "meeting":
+                self._ui_queue.put(("meeting_title", MEETING_START_TITLE))
+
+    # ------------------------------- progression / annulation d'une réunion --
+    def _meeting_partial_path(self):
+        """Brouillon de la transcription en cours (filet anti-plantage)."""
+        return os.path.join(TRANSCRIPTS_DIR, "reunion_transcription_en_cours.txt")
+
+    def _clear_meeting_partial(self):
+        try:
+            os.remove(self._meeting_partial_path())
+        except OSError:
+            pass
+
+    def _collect_meeting_segments(self, segments, total):
+        """Parcourt le générateur de passages en affichant la progression, en
+        sauvegardant le texte au fil de l'eau et en respectant une demande
+        d'annulation. Renvoie (liste des passages, annulée ?)."""
+        seglist = []
+        partial = self._meeting_partial_path()
+        last_pct = -1
+        self._ui_queue.put(("meeting_title", MEETING_TRANSCRIBE_TITLE))
+        for s in segments:
+            seglist.append(s)
+            if total > 0:
+                pct = min(99, int(s.end / total * 100))
+                if pct != last_pct:
+                    last_pct = pct
+                    self._ui_queue.put(("meeting_progress", pct))
+            # Brouillon sur disque toutes les 10 phrases : si l'app est tuée pendant
+            # une longue transcription, le travail déjà fait reste lisible.
+            if len(seglist) % 10 == 0:
+                try:
+                    with open(partial, "w", encoding="utf-8") as f:
+                        f.write(" ".join(x.text.strip() for x in seglist))
+                except Exception as e:
+                    log(f"brouillon de transcription : {e}")
+            if self._transcribe_cancel:
+                log("Transcription de réunion annulée par l'utilisateur.")
+                return seglist, True
+        return seglist, False
 
     # ------------------------------------------------- presse-papiers & collage --
     @staticmethod
@@ -1735,63 +2082,122 @@ class VoixFlashApp(rumps.App):
             self._ui_queue.put(("error", "Collage impossible : autorise « Accessibilité » dans les réglages."))
 
     # --------------------------------------------- boucle UI (thread principal) --
+    # Messages qui touchent à la STRUCTURE d'un menu (on retire puis on rajoute des
+    # items). Reconstruire un NSMenu pendant que l'utilisateur le déroule peut faire
+    # planter l'app : ces messages-là attendent le retour au mode de boucle normal.
+    _MENU_REBUILD_KINDS = ("history_changed", "diar_installed")
+
+    def _install_timer_common_modes(self):
+        """Fait battre le minuteur d'interface DANS TOUS LES MODES de la boucle
+        d'événements.
+
+        rumps n'inscrit son NSTimer qu'en NSDefaultRunLoopMode. Conséquence : dès
+        qu'un menu est déroulé ou qu'une fenêtre est ouverte, macOS bascule en mode
+        « suivi » et le minuteur CESSE de battre — l'indicateur d'état se fige et les
+        messages des threads de fond s'empilent sans jamais être appliqués. On
+        inscrit donc le même minuteur dans les modes communs."""
+        if NSRunLoop is None or NSRunLoopCommonModes is None:
+            return
+        try:
+            NSRunLoop.currentRunLoop().addTimer_forMode_(
+                self._timer._nstimer, NSRunLoopCommonModes)
+        except Exception as e:
+            log(f"minuteur (modes communs) : {e}")
+
+    def _runloop_is_idle(self):
+        """True si la boucle d'événements est dans son mode NORMAL, c'est-à-dire
+        qu'aucun menu n'est déroulé et qu'aucune fenêtre modale n'est ouverte.
+        Renvoie True si l'information est indéterminable (comportement d'avant)."""
+        if NSRunLoop is None or NSDefaultRunLoopMode is None:
+            return True
+        try:
+            mode = NSRunLoop.currentRunLoop().currentMode()
+        except Exception:
+            return True
+        return mode is None or str(mode) == str(NSDefaultRunLoopMode)
+
     def _drain_ui(self, _timer):
         """Appelée par le minuteur sur le thread principal : applique les changements d'UI."""
         try:
+            idle = self._runloop_is_idle()
+            batch = self._deferred          # ce qui attendait un moment sûr
+            self._deferred = []
             while True:
                 try:
-                    kind, payload = self._ui_queue.get_nowait()
+                    batch.append(self._ui_queue.get_nowait())
                 except queue.Empty:
                     break
-
-                if kind == "state":
-                    self._state = payload
-                    self._apply_state_icon(payload)
-                elif kind == "history_changed":
-                    self._refresh_history_menu()
-                elif kind == "meeting_result":
-                    self._present(self._show_transcript, payload)
-                elif kind == "meeting_title":
-                    # Demande du thread de garde-fous : remettre le titre du menu réunion.
-                    self.meeting_item.title = payload
-                elif kind == "import_title":
-                    # Bascule du libellé de l'item d'import (Importer ↔ Annuler ↔ repos).
-                    self.import_item.title = payload
-                elif kind == "import_progress":
-                    # Progression d'un import affichée dans le titre du menu (non modal). On
-                    # GARDE le mot « Annuler » : l'item reste cliquable pour interrompre.
-                    self.import_item.title = f"Annuler la transcription… ({payload} %)"
-                elif kind == "error":
-                    self._present(self._show_error, payload)
-                elif kind == "info":
-                    title, msg = payload
-                    self._present(self._show_info, title, msg)
-                elif kind == "diar_installed":
-                    # Fin de l'installation du module de séparation des locuteurs.
-                    self.diar_item.title = "Séparer les locuteurs (réunions)"
-                    if payload:
-                        self.config["diarization_enabled"] = True
-                        save_json(CONFIG_PATH, self.config)
-                        self._refresh_diar_menu()
-                        self._present(self._show_info, "Séparation des locuteurs activée",
-                                      "C'est prêt ! Tes prochaines réunions distingueront "
-                                      "« Locuteur 1 », « Locuteur 2 », etc.\n\nAstuce : indique "
-                                      "le nombre de personnes dans « Réunions › Locuteurs "
-                                      "attendus » si tu le connais — sinon, laisse « Automatique ».")
-                    else:
-                        self._refresh_diar_menu()
-                        self._present(self._show_error,
-                                      "Le module de séparation des locuteurs n'a pas pu être "
-                                      "installé (téléchargement interrompu ou connexion coupée). "
-                                      "Réessaie depuis « Réunions › Séparer les locuteurs ».")
-                elif kind == "welcome":
-                    self._present(self._show_welcome)
+            for kind, payload in batch:
+                if kind in self._MENU_REBUILD_KINDS and not idle:
+                    self._deferred.append((kind, payload))
+                    continue
+                self._apply_ui(kind, payload)
         except Exception as e:
             log(f"drain UI : {e}")
 
+    def _apply_ui(self, kind, payload):
+        """Applique UN message d'interface. Thread principal uniquement."""
+        try:
+            if kind == "state":
+                self._state = payload
+                self._apply_state_icon(payload)
+            elif kind == "history_changed":
+                self._refresh_history_menu()
+            elif kind == "meeting_result":
+                self._present(self._show_transcript, payload)
+            elif kind == "meeting_title":
+                # Demande du thread de garde-fous : remettre le titre du menu réunion.
+                self.meeting_item.title = payload
+            elif kind == "import_title":
+                # Bascule du libellé de l'item d'import (Importer ↔ Annuler ↔ repos).
+                self.import_item.title = payload
+            elif kind == "import_progress":
+                # Progression d'un import affichée dans le titre du menu (non modal). On
+                # GARDE le mot « Annuler » : l'item reste cliquable pour interrompre.
+                self.import_item.title = f"Annuler la transcription… ({payload} %)"
+            elif kind == "error":
+                self._present(self._show_error, payload)
+            elif kind == "info":
+                title, msg = payload
+                self._present(self._show_info, title, msg)
+            elif kind == "diar_installed":
+                # Fin de l'installation du module de séparation des locuteurs.
+                self.diar_item.title = "Séparer les locuteurs (réunions)"
+                if payload:
+                    self.config["diarization_enabled"] = True
+                    save_json(CONFIG_PATH, self.config)
+                    self._refresh_diar_menu()
+                    self._present(self._show_info, "Séparation des locuteurs activée",
+                                  "C'est prêt ! Tes prochaines réunions distingueront "
+                                  "« Locuteur 1 », « Locuteur 2 », etc.\n\nAstuce : indique "
+                                  "le nombre de personnes dans « Réunions › Locuteurs "
+                                  "attendus » si tu le connais — sinon, laisse « Automatique ».")
+                else:
+                    self._refresh_diar_menu()
+                    self._present(self._show_error,
+                                  "Le module de séparation des locuteurs n'a pas pu être "
+                                  "installé (téléchargement interrompu ou connexion coupée). "
+                                  "Réessaie depuis « Réunions › Séparer les locuteurs ».")
+            elif kind == "meeting_progress":
+                # Progression de la transcription d'une réunion, dans le titre de
+                # l'item (non modal). On GARDE le mot « Annuler » : l'item reste
+                # cliquable pour interrompre et garder ce qui est déjà transcrit.
+                self.meeting_item.title = f"Annuler la transcription… ({payload} %)"
+            elif kind == "recover_meeting":
+                self._present(self._offer_recovery, payload)
+            elif kind == "welcome":
+                self._present(self._show_welcome)
+        except Exception as e:
+            log(f"application UI ({kind}) : {e}")
+
     def _present(self, func, *args):
-        """Affiche une fenêtre modale au tour de boucle SUIVANT : le drain rend la main
-        tout de suite et l'indicateur ne reste pas figé pendant qu'on prépare la fenêtre."""
+        """Affiche une fenêtre modale au tour de boucle SUIVANT.
+
+        Deux raisons, toutes deux importantes :
+        • le drain rend la main tout de suite, donc l'indicateur ne se fige pas ;
+        • callAfter n'est distribué QUE dans le mode normal de la boucle. Les fenêtres
+          s'ouvrent donc forcément l'une après l'autre, jamais imbriquées, et jamais
+          pendant qu'un menu est déroulé."""
         if AppHelper is not None:
             try:
                 AppHelper.callAfter(func, *args)
@@ -1842,27 +2248,47 @@ class VoixFlashApp(rumps.App):
         except Exception as e:
             log(f"watchdog : {e}")
 
+    @staticmethod
+    def _modal_alert(**kwargs):
+        """UNIQUE point de passage vers rumps.alert.
+
+        Le passage au premier plan (app_to_front) est indispensable : sans lui,
+        l'alerte s'ouvre derrière la fenêtre active et son runModal() bloque le
+        thread principal sur un dialogue que l'utilisateur ne voit pas. L'app paraît
+        alors gelée alors qu'elle attend simplement un clic.
+
+        Renvoie le bouton cliqué : 1 = ok, 0 = cancel, -1 = other (jamais d'exception)."""
+        try:
+            app_to_front()
+            r = rumps.alert(**kwargs)
+        except Exception as e:
+            log(f"alerte : {e} — {kwargs.get('title')} : {kwargs.get('message')}")
+            return 0
+        # Sur macOS actuel, ce type d'alerte renvoie déjà 1 / 0 / -1. Certaines
+        # versions renvoient des NSModalResponse (1000, 1001…) numérotés dans l'ordre
+        # d'affichage des boutons : on ramène alors à la même convention, pour qu'un
+        # « Annuler » ne puisse jamais être pris pour un « Confirmer ».
+        if isinstance(r, int) and r >= 1000:
+            ordre = [1]
+            if kwargs.get("other"):
+                ordre.append(-1)
+            if kwargs.get("cancel"):
+                ordre.append(0)
+            idx = r - 1000
+            return ordre[idx] if 0 <= idx < len(ordre) else 0
+        return r
+
     def _show_error(self, msg):
         """Affiche une erreur de façon TOUJOURS visible (alerte, marche sans bundle)."""
-        try:
-            rumps.alert(title=APP_NAME, message=msg, ok="OK")
-        except Exception as e:
-            log(f"alerte erreur : {e} — {msg}")
+        self._modal_alert(title=APP_NAME, message=msg, ok="OK")
 
     def _show_info(self, title, msg):
         """Petite information visible (les notifications macOS ne marchent pas hors bundle)."""
-        try:
-            rumps.alert(title=title, message=msg, ok="OK")
-        except Exception as e:
-            log(f"alerte info : {e} — {title} : {msg}")
+        self._modal_alert(title=title, message=msg, ok="OK")
 
     def _confirm(self, msg, ok="Confirmer", cancel="Annuler"):
         """Demande une confirmation. Renvoie True si l'utilisateur valide."""
-        try:
-            return bool(rumps.alert(title=APP_NAME, message=msg, ok=ok, cancel=cancel))
-        except Exception as e:
-            log(f"confirmation : {e}")
-            return False
+        return self._modal_alert(title=APP_NAME, message=msg, ok=ok, cancel=cancel) == 1
 
     # ------------------------------------------------------------- actions menu --
     def toggle_meeting(self, sender):
@@ -1872,12 +2298,20 @@ class VoixFlashApp(rumps.App):
         with self._lock:
             recording = self._recording
             mode = self._record_mode
+            transcribing_meeting = self._transcribing_meeting
         if recording and mode == "flash":
             return  # une dictée éclair est en cours, on ne touche à rien
+        if transcribing_meeting and not recording:
+            # L'item sert alors de bouton « Annuler » : on interrompt la transcription
+            # en gardant ce qui a déjà été reconnu (comme pour un import).
+            with self._lock:
+                self._transcribe_cancel = True
+            sender.title = "Annulation en cours…"
+            return
         if not recording:
             if self._transcribing:
-                # Un import de fichier (ou la fin d'une réunion) est en cours de
-                # transcription : on ne lance pas un enregistrement par-dessus.
+                # Un import de fichier est en cours de transcription : on ne lance pas
+                # un enregistrement par-dessus.
                 self._present(self._show_error, "Une transcription est déjà en cours, réessaie dans un instant.")
                 return
             if self.model is None:
@@ -1890,6 +2324,105 @@ class VoixFlashApp(rumps.App):
             sender.title = MEETING_START_TITLE
             self._stop_recording()
 
+    # --------------------------------------- réunions interrompues (récupération) --
+    def _offer_recovery(self, items):
+        """Propose de transcrire les réunions retrouvées sur le disque au démarrage.
+        Thread principal (appelée via _present)."""
+        for raw, meta, sr, dur in items:
+            choix = self._modal_alert(
+                title="Réunion interrompue retrouvée",
+                message=f"Un enregistrement de {fmt_duration(dur)} n'a jamais été "
+                        "transcrit (VoixFlash a été fermé ou interrompu pendant la "
+                        "réunion).\n\nL'audio est intact. Que veux-tu en faire ?\n\n"
+                        "« Plus tard » le garde : il te sera reproposé au prochain "
+                        "démarrage.",
+                ok="Transcrire maintenant", cancel="Plus tard", other="Supprimer",
+            )
+            if choix == -1:                          # Supprimer
+                # Confirmation obligatoire : « Supprimer » se retrouve juste sous le
+                # bouton par défaut, et l'audio effacé ici est irrécupérable.
+                if self._confirm(
+                        f"Supprimer définitivement cet enregistrement de "
+                        f"{fmt_duration(dur)} ? Il n'a jamais été transcrit et ne "
+                        "pourra plus l'être.",
+                        ok="Supprimer", cancel="Le garder"):
+                    self._discard_disk_backup((raw, meta))
+                    log(f"Réunion interrompue supprimée : {os.path.basename(raw)}")
+                continue
+            if choix != 1:                           # Plus tard
+                continue
+            # ⚠ Jamais d'alerte sous le verrou : elle bloque le thread principal
+            # jusqu'au clic, et tous les threads de fond resteraient bloqués derrière.
+            with self._lock:
+                occupe = self._recording or self._transcribing
+                if not occupe:
+                    self._transcribing = True
+                    self._transcribing_meeting = True
+                    self._transcribe_cancel = False
+            if occupe:
+                self._show_error("Une transcription est déjà en cours. "
+                                 "La réunion retrouvée te sera reproposée plus tard.")
+                return
+            self._ui_queue.put(("state", "transcribing"))
+            threading.Thread(target=self._run_recovery, args=(raw, meta, sr),
+                             daemon=True).start()
+            return          # une seule à la fois : les autres reviendront au démarrage suivant
+
+    def _run_recovery(self, raw, meta, sr):
+        """Relit une sauvegarde brute et la transcrit comme une réunion. Thread de fond."""
+        try:
+            log(f"Reprise de la réunion interrompue : {os.path.basename(raw)}")
+            # La proposition arrive au démarrage, souvent AVANT que le moteur soit
+            # chargé : on l'attend ici plutôt que de renvoyer l'utilisateur à plus tard.
+            attente = 0.0
+            while self.model is None and attente < 180.0:
+                time.sleep(1.0)
+                attente += 1.0
+            if self.model is None:
+                self._ui_queue.put(("error", "Le moteur de transcription n'a pas pu être "
+                                             "chargé. L'enregistrement est conservé : il te "
+                                             "sera reproposé au prochain démarrage."))
+                self._ui_queue.put(("state", "idle"))
+                with self._lock:
+                    self._transcribing = False
+                    self._transcribing_meeting = False
+                return
+            pcm = np.fromfile(raw, dtype=np.int16)
+            audio = pcm.astype(np.float32) / 32768.0
+            del pcm
+            self._process_audio(audio, sr, "meeting", backup=(raw, meta))
+        except Exception as e:
+            log(f"reprise de réunion : {e}")
+            self._ui_queue.put(("error", f"Impossible de relire l'enregistrement retrouvé : {e}"))
+            self._ui_queue.put(("state", "idle"))
+            with self._lock:
+                self._transcribing = False
+                self._transcribing_meeting = False
+
+    def _abort_recording(self):
+        """Coupe le micro SANS transcrire, en gardant la sauvegarde brute sur le disque.
+        Utilisé au redémarrage / à la fermeture : la réunion sera reproposée au
+        prochain démarrage plutôt que perdue."""
+        with self._lock:
+            if not self._recording:
+                return False
+            self._recording = False
+            self._record_mode = None
+            self._record_start = None
+            stream = self._stream
+            self._stream = None
+            self._frames = []
+        try:
+            if stream is not None:
+                stream.stop()
+                stream.close()
+        except Exception as e:
+            log(f"arrêt du flux (abandon) : {e}")
+        paths = self._stop_disk_backup()
+        log(f"Enregistrement interrompu et conservé : "
+            f"{os.path.basename(paths[0]) if paths else 'aucune sauvegarde'}")
+        return True
+
     # ------------------------------------------------ import d'un fichier audio --
     def _pick_audio_file(self):
         """Ouvre le sélecteur de fichier natif macOS et renvoie le chemin choisi (ou None
@@ -1899,6 +2432,7 @@ class VoixFlashApp(rumps.App):
             self._show_error("Sélecteur de fichier indisponible sur ce système.")
             return None
         try:
+            app_to_front()          # sinon le sélecteur s'ouvre derrière l'app active
             panel = NSOpenPanel.openPanel()
             panel.setCanChooseFiles_(True)
             panel.setCanChooseDirectories_(False)
@@ -1954,10 +2488,13 @@ class VoixFlashApp(rumps.App):
         if self.model is None:
             self._show_error("Le moteur de transcription se charge encore, réessaie dans un instant.")
             return
+        # ⚠ L'alerte est affichée HORS du verrou : une fenêtre modale bloque le thread
+        # principal jusqu'au clic, et le verrou resterait tenu tout ce temps.
         with self._lock:
-            if self._recording or self._transcribing:
-                self._show_error("Une transcription est déjà en cours, réessaie dans un instant.")
-                return
+            occupe = self._recording or self._transcribing
+        if occupe:
+            self._show_error("Une transcription est déjà en cours, réessaie dans un instant.")
+            return
 
         path = self._pick_audio_file()
         if not path:
@@ -1987,14 +2524,16 @@ class VoixFlashApp(rumps.App):
                     "Lancer ?", ok="Lancer", cancel="Annuler"):
                     return
 
-        # Réservation de l'état et lancement du thread de fond.
+        # Réservation de l'état et lancement du thread de fond (alerte hors verrou).
         with self._lock:
-            if self._recording or self._transcribing:
-                self._show_error("Une transcription est déjà en cours, réessaie dans un instant.")
-                return
-            self._transcribing = True
-            self._importing = True
-            self._import_cancel = False
+            occupe = self._recording or self._transcribing
+            if not occupe:
+                self._transcribing = True
+                self._importing = True
+                self._import_cancel = False
+        if occupe:
+            self._show_error("Une transcription est déjà en cours, réessaie dans un instant.")
+            return
         self._ui_queue.put(("state", "transcribing"))
         self._ui_queue.put(("import_title", IMPORT_CANCEL_TITLE))
         threading.Thread(target=self._run_import, args=(path, dur), daemon=True).start()
@@ -2394,7 +2933,15 @@ class VoixFlashApp(rumps.App):
         entry_id = entry.get("id")
         kind = "réunion" if mode == "meeting" else "dictée"
         ts = entry.get("ts", "")
+        # Texte long : le champ de saisie de rumps est un NSTextField simple, sans
+        # défilement. Y charger une réunion entière fige le thread principal pendant
+        # la mise en page, et le texte reste de toute façon illisible. On passe donc
+        # par un vrai fichier ouvert dans TextEdit.
+        if len(original) > LONG_TEXT_CHARS:
+            self._show_long_transcript(entry, original, kind, ts)
+            return
         try:
+            app_to_front()
             win = rumps.Window(
                 title=f"Transcription · {kind}",
                 message=f"{ts}\n\nModifie le texte si besoin, puis choisis une action.",
@@ -2430,6 +2977,34 @@ class VoixFlashApp(rumps.App):
         except Exception as e:
             log(f"fenêtre transcription : {e}")
 
+    def _show_long_transcript(self, entry, text, kind, ts):
+        """Longue transcription : on l'écrit dans un .txt daté et on propose de
+        l'ouvrir dans TextEdit (défilement, recherche, modification, impression) —
+        tout ce qu'une fenêtre d'alerte ne sait pas faire."""
+        stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        prefix = "reunion" if entry.get("mode") == "meeting" else "dictee"
+        path = os.path.join(TRANSCRIPTS_DIR, f"{prefix}_{stamp}.txt")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+        except Exception as e:
+            log(f"écriture de la transcription longue : {e}")
+            self._show_error(f"Le texte est dans l'historique, mais le fichier n'a pas "
+                             f"pu être écrit : {e}")
+            return
+        mots = len(text.split())
+        choix = self._modal_alert(
+            title=f"Transcription · {kind}",
+            message=f"{ts}\n\nLe texte fait {mots} mots : il est enregistré dans "
+                    f"l'historique et dans un fichier.\n\n{path}",
+            ok="Ouvrir le texte", cancel="Fermer", other="Copier",
+        )
+        if choix == 1:
+            self._run([OPEN, "-e", path])       # TextEdit
+        elif choix == -1:
+            self._set_clipboard(text)
+            self._show_info("Copié", "Le texte a été copié dans le presse-papiers.")
+
     # ------------------------------------------------------ aide & autorisations --
     def show_guide(self, _sender):
         """Mode d'emploi complet : rassemble toutes les règles utiles (y compris les
@@ -2460,6 +3035,16 @@ class VoixFlashApp(rumps.App):
             "  Menu › « Démarrer une réunion ». Parle aussi longtemps que tu veux.\n"
             "  Menu › « Arrêter la réunion » : le texte s'affiche dans une fenêtre\n"
             "  DANS l'application — il n'est PAS collé ailleurs.\n"
+            "  La transcription affiche sa progression dans le menu et peut être\n"
+            "  interrompue : ce qui est déjà reconnu est gardé.\n"
+            "  Une réunion de plus de 4 000 caractères s'ouvre dans TextEdit plutôt\n"
+            "  que dans une fenêtre (défilement, recherche, impression).\n"
+            "\n"
+            "• RIEN N'EST PERDU\n"
+            "  Pendant une réunion, l'audio est écrit sur le disque en continu. Si\n"
+            "  VoixFlash est fermé de force, plante, ou que le Mac s'éteint, il te\n"
+            "  proposera de transcrire l'enregistrement au démarrage suivant.\n"
+            "  Idem si tu choisis « Quitter » ou « Redémarrer » pendant une réunion.\n"
             "\n"
             "• IMPORTER UN FICHIER AUDIO (menu › Réunions › « Importer un fichier\n"
             "  audio… »)\n"
@@ -2533,7 +3118,9 @@ class VoixFlashApp(rumps.App):
             "   • forme d'onde ............... transcrit (réunion, dictée OU import)\n"
             "   • presse-papiers ............. écrit le texte\n"
             "Pendant un import de fichier, le menu « Réunions » affiche aussi la\n"
-            "progression (« Transcription du fichier… NN % »).\n"
+            "progression (« Transcription du fichier… NN % »), et pendant la\n"
+            "transcription d'une réunion, l'item « Démarrer une réunion » devient\n"
+            "« Annuler la transcription… NN % ».\n"
             "Quand l'icône est sur « enregistre », le micro tourne : ne l'oublie pas.\n"
             "Sur un MacBook, l'icône peut se cacher derrière l'encoche de la caméra :\n"
             "réduis le nombre d'icônes voisines si tu ne la vois pas.\n"
@@ -2595,6 +3182,7 @@ class VoixFlashApp(rumps.App):
         )
 
         try:
+            app_to_front()
             win = rumps.Window(
                 title="VoixFlash — Mode d'emploi",
                 message="Fais défiler pour tout lire. Ce panneau est informatif "
@@ -2611,7 +3199,7 @@ class VoixFlashApp(rumps.App):
         # On affiche le chemin STABLE du lanceur (celui que launchd utilise), pas le
         # realpath profond sous ~/.local/share/uv qui change à chaque mise à jour de uv.
         # Dans la liste de macOS, l'entrée apparaît sous le nom « Python ».
-        rumps.alert(
+        self._modal_alert(
             title="Autorisations VoixFlash",
             message="Dans Réglages › Confidentialité, l'entrée à activer apparaît sous "
                     "le nom « Python ». Active-la pour :\n"
@@ -2636,7 +3224,7 @@ class VoixFlashApp(rumps.App):
         self._run([OPEN, "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"])
 
     def _show_welcome(self):
-        rumps.alert(
+        self._modal_alert(
             title="Bienvenue dans VoixFlash 🎙️",
             message="Avant la première utilisation, autorise 3 choses dans les réglages "
                     "du Mac (menu « Aide & autorisations ») :\n\n"
@@ -2652,21 +3240,19 @@ class VoixFlashApp(rumps.App):
     def restart_app(self, _sender):
         """Relance l'application (utile après avoir accordé des autorisations)."""
         if self._recording:
-            try:
-                ok = rumps.alert(
-                    title="Enregistrement en cours",
-                    message="Un enregistrement est en cours et sera perdu si tu redémarres "
-                            "maintenant. Continuer ?",
-                    ok="Redémarrer quand même", cancel="Annuler",
-                )
-            except Exception:
-                ok = 1
-            if not ok:
+            ok = self._modal_alert(
+                title="Enregistrement en cours",
+                message="Un enregistrement est en cours. Si tu redémarres maintenant, il "
+                        "sera CONSERVÉ sur le disque et VoixFlash te proposera de le "
+                        "transcrire au prochain démarrage.\n\nRedémarrer ?",
+                ok="Redémarrer", cancel="Annuler",
+            )
+            if ok != 1:
                 return
             try:
-                self._stop_recording()      # libère proprement le micro
-            except Exception:
-                pass
+                self._abort_recording()     # libère le micro, garde l'audio
+            except Exception as e:
+                log(f"arrêt avant redémarrage : {e}")
         try:
             if self._listener:
                 self._listener.stop()
@@ -2706,6 +3292,27 @@ class VoixFlashApp(rumps.App):
         return False
 
     def quit_app(self, _sender):
+        # Enregistrement en cours : on demande confirmation, puis on coupe le micro en
+        # GARDANT l'audio sur le disque (reproposé au prochain démarrage).
+        if self._recording:
+            if self._modal_alert(
+                    title="Enregistrement en cours",
+                    message="Un enregistrement est en cours. Si tu quittes maintenant, il "
+                            "sera CONSERVÉ et te sera proposé au prochain démarrage.\n\n"
+                            "Quitter ?",
+                    ok="Quitter", cancel="Annuler") != 1:
+                return
+            try:
+                self._abort_recording()
+            except Exception as e:
+                log(f"arrêt avant fermeture : {e}")
+        elif self._transcribing:
+            if self._modal_alert(
+                    title="Transcription en cours",
+                    message="Une transcription est en cours et sera perdue si tu quittes "
+                            "maintenant.\n\nQuitter quand même ?",
+                    ok="Quitter", cancel="Annuler") != 1:
+                return
         try:
             if self._listener:
                 self._listener.stop()
