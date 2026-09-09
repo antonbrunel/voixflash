@@ -1,5 +1,45 @@
 # Journal des versions — VoixFlash
 
+## 1.6.0 — des réunions lisibles, et un micro qui se signale quand il est mort
+
+- **« Locuteurs attendus » veut enfin dire quelque chose.** Le nombre choisi était
+  transmis tel quel au moteur de séparation, qui ne l'honorait pas : mesuré sur un
+  enregistrement à quatre voix, demander 2 locuteurs en rendait **un seul**, et demander
+  3 en rendait deux. Le réglage annoncé comme « plus fiable » écrasait donc des
+  personnes réelles. Le nombre est maintenant un **plafond**, appliqué après coup en
+  fondant les deux voix les plus proches l'une dans l'autre, jusqu'à tenir sous la
+  limite. Demander « 2 au plus » rend bien 2 locuteurs. Un plafond plus large que ce qui
+  a été détecté ne force plus rien du tout.
+- **Ce plafond ne coûte presque rien.** Refaire tourner le moteur aurait ajouté une
+  dizaine de minutes sur une réunion d'une heure (mesuré à 0,24 fois la durée de
+  l'audio). On réutilise le passage déjà fait et on recalcule une empreinte par voix :
+  80 ms par prise de parole, une quinzaine de secondes sur une heure.
+- **« J'étais seul » ne lance plus la séparation du tout**, au lieu de fabriquer des
+  interlocuteurs imaginaires.
+- **Les réunions se lisent.** Un horodatage par PARAGRAPHE au lieu d'un toutes les trois
+  secondes, les paragraphes étant ouverts par un blanc dans la parole ou par une phrase
+  terminée. Un blanc de plus de 20 secondes est signalé explicitement. C'est la
+  différence entre une transcription d'une heure consultable et illisible.
+- **Les respirations ne coupent plus la parole.** Le moteur découpait une phrase en
+  trois tours dès qu'on reprenait son souffle, et le texte se retrouvait haché par des
+  « — Locuteur 2 : » à répétition alors que personne n'avait rendu la parole.
+- **Un « oui » lancé pendant que l'autre parle** ne déclenche plus deux changements
+  d'en-tête pour trois mots.
+- **Micro muet : on le dit.** Une entrée audio peut délivrer un enregistrement
+  techniquement parfait et strictement vide (canal muet d'une interface, périphérique
+  virtuel créé par un appel en cours). Whisper en tirait une phrase inventée, sans
+  qu'on comprenne d'où elle sortait. Un signal exactement nul est maintenant reconnu
+  comme une panne de route audio et signalé comme telle. Le test porte sur des zéros
+  parfaits, jamais sur un seuil de volume : se taire quelques secondes reste normal.
+- **Deux canaux sont mélangés au lieu d'un seul repris.** Sur une interface audio, le
+  micro n'est pas forcément sur le premier canal. Si l'ouverture à deux canaux échoue,
+  on retombe sur l'ancien comportement, donc rien de ce qui marchait ne peut cesser de
+  marcher.
+- **Hallucinations françaises.** Les formules de fin de vidéo (« Merci d'avoir regardé
+  cette vidéo », « Abonnez-vous ») sont écartées quand elles constituent la totalité du
+  texte reconnu, et uniquement dans ce cas : « Abonnez-vous à la newsletter avant
+  vendredi » reste une vraie dictée.
+
 ## 1.5.0 — la dictée sait se faire comprendre
 
 - **Retour sonore.** Un son quand la capture démarre, un autre quand elle s'arrête, un

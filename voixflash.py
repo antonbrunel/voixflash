@@ -92,7 +92,7 @@ except Exception:
 #  Chemins & constantes
 # --------------------------------------------------------------------------- #
 APP_NAME = "VoixFlash"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 LAUNCHD_LABEL = "com.voixflash.agent"   # étiquette du LaunchAgent (cf. install.command)
 APP_HOME = os.path.expanduser(f"~/Library/Application Support/{APP_NAME}")
 CONFIG_PATH = os.path.join(APP_HOME, "config.json")
@@ -135,7 +135,15 @@ DIAR_SEG_URL = ("https://github.com/k2-fsa/sherpa-onnx/releases/download/"
 DIAR_EMB_URL = ("https://github.com/k2-fsa/sherpa-onnx/releases/download/"
                 "speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx")
 # Choix « nombre de locuteurs attendus » proposé dans le menu (libellé, valeur ; 0 = auto).
-DIAR_SPEAKER_CHOICES = [("Automatique", 0), ("2", 2), ("3", 3), ("4", 4), ("5", 5), ("6", 6)]
+# Ce nombre est un PLAFOND, pas une consigne exacte : cf. diarize(). Un plancher forcerait
+# le regroupement à remonter et scinderait de vraies voix, exactement l'inverse du défaut
+# qu'on cherche à corriger.
+DIAR_SPEAKER_CHOICES = [("Automatique (aucune limite)", 0), ("1 : j'étais seul", 1),
+                        ("2 au plus", 2), ("3 au plus", 3), ("4 au plus", 4),
+                        ("5 au plus", 5), ("6 au plus", 6), ("7 au plus", 7),
+                        ("8 au plus", 8)]
+# Au-delà, contraindre n'a plus de sens : la sur-segmentation n'est plus le défaut dominant.
+DIAR_MAX_CONSTRAINED = 8
 
 # Outils macOS appelés en chemin absolu (fiabilité quand l'app est lancée par launchd).
 PBCOPY = "/usr/bin/pbcopy"
@@ -184,7 +192,7 @@ DEFAULT_CONFIG = {
     "beam_size": 5,              # qualité du décodage (5 = bon compromis)
     "mic_primed": False,         # le micro a-t-il déjà été « amorcé » (demande d'autorisation déclenchée) ?
     "diarization_enabled": False,  # séparer les locuteurs en réunion (« Locuteur 1 : … »)
-    "diarization_speakers": 0,   # nb de locuteurs attendus (0 = détection automatique)
+    "diarization_speakers": 0,   # plafond de locuteurs attendus (0 = aucune contrainte)
     "remove_hesitations": True,  # retirer les « euh », « hmm » du texte transcrit
     "sounds_enabled": True,      # petits sons au début et à la fin d'une dictée
 }
@@ -398,18 +406,55 @@ def hotkey_display(key):
 # mot), elles seraient collées dans le document. On écarte UNIQUEMENT des marqueurs qui
 # ne sont jamais une vraie dictée — volontairement conservateur : mieux vaut laisser
 # passer une rare hallucination que supprimer par erreur de la vraie parole.
+#
+# Deux niveaux, et la distinction est ce qui rend l'ajout de phrases françaises sûr :
+#   • MARKERS : signatures qui ne peuvent PAS apparaître dans une vraie dictée. Leur
+#     seule présence, où que ce soit, condamne le texte entier.
+#   • PHRASES : formules de fin de vidéo, qu'on pourrait très bien vouloir dicter. On
+#     ne les écarte que si elles constituent la TOTALITÉ du texte reconnu. « Abonnez-vous
+#     à la newsletter avant vendredi » est donc conservé, « Abonnez-vous » tout seul non.
 HALLUCINATION_MARKERS = (
     "amara.org",
     "sous-titres réalisés par",
     "sous-titrage société radio-canada",
+    "sous-titrage société radio",
     "soustitreur.com",
+    "sous-titres fait par",
+    "subtitles by the amara.org community",
 )
+
+HALLUCINATION_PHRASES = (
+    "merci d'avoir regardé cette vidéo",
+    "merci d'avoir regardé",
+    "merci à tous d'avoir regardé cette vidéo",
+    "abonnez-vous",
+    "n'oubliez pas de vous abonner",
+    "n'hésitez pas à vous abonner",
+    "abonnez-vous à la chaîne",
+    "likez et abonnez-vous",
+    "à bientôt pour une nouvelle vidéo",
+    "merci d'avoir suivi cette vidéo",
+    "thanks for watching",
+    "thank you for watching",
+    "please subscribe",
+)
+
+
+def _normalized_phrase(text):
+    """Texte réduit à ses mots, minuscules, sans ponctuation ni accents parasites."""
+    return " ".join(strip_accents((text or "").lower()).replace("’", "'").split()).strip(
+        " .,!?;:…-–—\"«»")
 
 
 def is_probably_hallucination(text):
     """True si le texte se résume à une phrase parasite connue de Whisper (silence)."""
     t = " ".join((text or "").lower().split())
-    return bool(t) and any(marker in t for marker in HALLUCINATION_MARKERS)
+    if not t:
+        return False
+    if any(marker in t for marker in HALLUCINATION_MARKERS):
+        return True
+    normalized = _normalized_phrase(text)
+    return normalized in {_normalized_phrase(p) for p in HALLUCINATION_PHRASES}
 
 
 # ------------------------------------------------- post-traitement du texte --
@@ -504,6 +549,35 @@ def input_is_bluetooth():
     except Exception:
         return False
     return any(m in name for m in ("airpods", "bluetooth", "hands-free", "headset", "beats"))
+
+
+def input_channel_count():
+    """Nombre de canaux à ouvrir sur l'entrée courante (1 ou 2).
+
+    Sur une interface audio (Focusrite, table de mixage, périphérique virtuel créé par
+    FaceTime ou WhatsApp pendant un appel), le micro n'est pas forcément sur le premier
+    canal. Ouvrir un seul canal peut alors donner un enregistrement techniquement
+    parfait et totalement silencieux, dont Whisper tire un « Thank you » systématique.
+    On ouvre donc deux canaux quand ils existent et on les MÉLANGE : la voix est
+    présente quel que soit le canal où elle arrive. Au-delà de deux, on s'en tient à
+    deux, pour ne pas transformer la dictée en console de mixage."""
+    try:
+        n = int(sd.query_devices(kind="input").get("max_input_channels", 1) or 1)
+    except Exception:
+        return 1
+    return 2 if n >= 2 else 1
+
+
+def audio_is_dead(audio):
+    """True si le signal est EXACTEMENT nul : le micro n'a rien délivré du tout.
+
+    Le test porte sur des zéros parfaits, jamais sur un seuil de volume : le silence
+    acoustique est un état parfaitement sain (on a simplement hésité avant de parler),
+    alors qu'un PCM strictement nul ne peut venir que d'une route audio morte."""
+    try:
+        return len(audio) > 0 and not np.any(audio)
+    except Exception:
+        return False
 
 
 def secure_input_enabled():
@@ -1297,40 +1371,208 @@ def drop_micro_speakers(diar, min_total=1.0):
     return [(start, end, renum[spk]) for (start, end, spk) in diar if spk in renum]
 
 
+def merge_adjacent_turns(diar, gap=0.4):
+    """Recolle les prises de parole successives d'une MÊME personne séparées d'un souffle.
+
+    Le moteur coupe à la moindre respiration : une phrase devient trois tours, et le
+    texte se retrouve haché par des en-têtes « — Locuteur 2 : » à répétition alors que
+    personne n'a rendu la parole. On ne fusionne jamais deux étiquettes différentes :
+    ce n'est pas une décision de regroupement, seulement du recollage."""
+    if not diar:
+        return diar
+    ordered = sorted(diar, key=lambda d: d[0])
+    out = [list(ordered[0])]
+    for start, end, spk in ordered[1:]:
+        last = out[-1]
+        if spk == last[2] and start - last[1] <= gap:
+            last[1] = max(last[1], end)
+        else:
+            out.append([start, end, spk])
+    return [tuple(x) for x in out]
+
+
+def smooth_speaker_flips(labels):
+    """Lisse les bascules d'UN seul passage entre deux passages du même locuteur.
+
+    « A A B A A » : le B isolé est presque toujours une erreur d'attribution sur un
+    « oui » ou un « d'accord » prononcé pendant que l'autre parlait. Le rendre à A
+    évite deux changements d'en-tête pour trois mots. On ne touche pas aux séquences
+    de deux passages ou plus, qui sont de vraies prises de parole."""
+    out = list(labels)
+    for i in range(1, len(out) - 1):
+        if out[i - 1] is not None and out[i - 1] == out[i + 1] and out[i] != out[i - 1]:
+            out[i] = out[i - 1]
+    return out
+
+
+_embedder = None
+
+
+def _embedding_extractor():
+    """Extracteur d'empreintes vocales, construit une fois (100 ms) puis réutilisé.
+
+    C'est le MÊME modèle que celui du moteur de séparation, déjà téléchargé : rien de
+    plus à installer. L'avoir à part est ce qui rend le plafond de locuteurs abordable
+    (cf. enforce_speaker_cap)."""
+    global _embedder
+    if _embedder is not None:
+        return _embedder
+    so = _load_sherpa()
+    if so is None or not os.path.exists(DIAR_EMB_PATH):
+        return None
+    try:
+        _embedder = so.SpeakerEmbeddingExtractor(
+            so.SpeakerEmbeddingExtractorConfig(model=DIAR_EMB_PATH,
+                                               num_threads=CPU_THREADS))
+    except Exception as e:
+        log(f"extracteur d'empreintes indisponible : {e}")
+        _embedder = None
+    return _embedder
+
+
+# Tours retenus pour caractériser une voix. Trop court, l'empreinte est du bruit ; trop
+# long, on paie pour rien. Trois échantillons suffisent à stabiliser un centroïde.
+EMB_MIN_S, EMB_MAX_S, EMB_SAMPLES = 1.5, 10.0, 3
+
+
+def speaker_centroids(audio, diar):
+    """Une empreinte moyenne par locuteur, calculée sur ses tours les plus longs.
+
+    Renvoie {locuteur: vecteur normalisé} ou None si l'extracteur est indisponible."""
+    ex = _embedding_extractor()
+    if ex is None or not diar:
+        return None
+    by_speaker = {}
+    for start, end, spk in diar:
+        by_speaker.setdefault(spk, []).append((end - start, start, end))
+    out = {}
+    try:
+        for spk, turns in by_speaker.items():
+            usable = [t for t in turns if t[0] >= EMB_MIN_S]
+            usable.sort(reverse=True)              # les plus longs d'abord
+            vectors = []
+            for _, start, end in usable[:EMB_SAMPLES]:
+                piece = audio[int(start * 16000):int(min(end, start + EMB_MAX_S) * 16000)]
+                if len(piece) < int(EMB_MIN_S * 16000):
+                    continue
+                stream = ex.create_stream()
+                stream.accept_waveform(sample_rate=16000, waveform=piece)
+                stream.input_finished()
+                vectors.append(np.asarray(ex.compute(stream), dtype=np.float32))
+            if vectors:
+                mean = np.mean(vectors, axis=0)
+                out[spk] = mean / (float(np.linalg.norm(mean)) + 1e-9)
+    except Exception as e:
+        log(f"empreintes des locuteurs : {e}")
+        return None
+    return out or None
+
+
+def enforce_speaker_cap(audio, diar, cap):
+    """Ramène le nombre de locuteurs à `cap` en fusionnant les voix les plus proches.
+
+    Pourquoi pas simplement relancer le moteur en lui imposant le nombre : d'abord
+    parce qu'un second passage coûte, mesuré sur cette pile, environ 0,24 fois la durée
+    de l'audio, soit une dizaine de minutes de plus sur une réunion d'une heure ;
+    ensuite parce que le nombre demandé n'est pas honoré. Mesure sur un enregistrement
+    à quatre voix : num_clusters=2 rend UN seul locuteur, num_clusters=3 en rend deux.
+    Le réglage se comporte comme une consigne approximative, et il écrase en fondant
+    tout dans un groupe unique.
+
+    Ici on garde le seul passage déjà fait, on recalcule une empreinte par voix (mesuré
+    à 80 ms par tour, soit une quinzaine de secondes sur une heure de réunion) et on
+    fusionne les deux plus proches, encore et encore, jusqu'à tenir sous le plafond.
+    C'est la voix la moins distincte qui cède, pas la partition entière."""
+    if not diar or cap <= 0:
+        return diar
+    labels = {spk for _, _, spk in diar}
+    if len(labels) <= cap:
+        return diar                    # rien à faire, et surtout rien à payer
+    centroids = speaker_centroids(audio, diar)
+    if not centroids or len(centroids) <= cap:
+        log("plafond de locuteurs : empreintes indisponibles, plafond non appliqué.")
+        return diar
+    # Poids = temps de parole : fusionner une voix de 3 s dans une de 20 min ne doit
+    # pas déplacer le centroïde de cette dernière.
+    weights = {}
+    for start, end, spk in diar:
+        weights[spk] = weights.get(spk, 0.0) + max(0.0, end - start)
+    groups = {spk: [spk] for spk in centroids}
+    while len(groups) > cap:
+        keys = sorted(groups)
+        best = None
+        for i, a in enumerate(keys):
+            for b in keys[i + 1:]:
+                distance = 1.0 - float(np.dot(centroids[a], centroids[b]))
+                if best is None or distance < best[0]:
+                    best = (distance, a, b)
+        if best is None:
+            break
+        distance, a, b = best
+        wa, wb = max(weights.get(a, 0.0), 1e-6), max(weights.get(b, 0.0), 1e-6)
+        merged = centroids[a] * wa + centroids[b] * wb
+        centroids[a] = merged / (float(np.linalg.norm(merged)) + 1e-9)
+        weights[a] = wa + wb
+        groups[a].extend(groups.pop(b))
+        centroids.pop(b)
+        log(f"plafond de locuteurs : voix {b} fondue dans {a} (distance {distance:.3f}).")
+    remap = {old: new for new, members in groups.items() for old in members}
+    capped = [(start, end, remap.get(spk, spk)) for start, end, spk in diar]
+    return merge_adjacent_turns(drop_micro_speakers(capped))
+
+
+def _diarize_once(so, audio, num_clusters, threshold, progress=None):
+    """Un passage du moteur de séparation. num_clusters = -1 pour la détection libre."""
+    cfg = so.OfflineSpeakerDiarizationConfig(
+        segmentation=so.OfflineSpeakerSegmentationModelConfig(
+            pyannote=so.OfflineSpeakerSegmentationPyannoteModelConfig(model=DIAR_SEG_PATH)),
+        embedding=so.SpeakerEmbeddingExtractorConfig(
+            model=DIAR_EMB_PATH, num_threads=CPU_THREADS),
+        clustering=so.FastClusteringConfig(num_clusters=num_clusters, threshold=threshold),
+        min_duration_on=0.3, min_duration_off=0.5)
+    engine = so.OfflineSpeakerDiarization(cfg)
+
+    def _cb(*a):
+        # sherpa appelle (n_traité, n_total[, arg]) ; on remonte une progression 0-100.
+        if progress is not None and len(a) >= 2 and a[1]:
+            try:
+                progress(min(100, int(a[0] / a[1] * 100)))
+            except Exception:
+                pass
+        return 0
+
+    segments = engine.process(audio, callback=_cb).sort_by_start_time()
+    return [(s.start, s.end, s.speaker) for s in segments]
+
+
 def diarize(audio, num_speakers=0, progress=None):
     """Sépare les locuteurs d'un enregistrement (float32 mono 16 kHz normalisé). Renvoie
     une liste de tuples (début_s, fin_s, id_locuteur) triés par début, ou None si
-    indisponible/échec. num_speakers : 0 = détection automatique, sinon nombre imposé."""
+    indisponible/échec.
+
+    `num_speakers` est un PLAFOND, jamais un plancher, et c'est délibéré : un minimum
+    erroné force le regroupement à remonter et scinde de vraies voix, exactement le
+    défaut qu'on cherche à corriger. Le moteur tourne donc toujours en détection libre,
+    et le plafond est appliqué après coup, sans second passage (cf. enforce_speaker_cap).
+
+    On ne passe JAMAIS le nombre attendu à `num_clusters` du moteur : mesuré sur un
+    enregistrement à quatre voix, num_clusters=2 rend un seul locuteur et num_clusters=3
+    en rend deux. Ce réglage ne tient pas sa promesse, et il la rate en fusionnant tout."""
     so = _load_sherpa()
     if so is None or not diarization_models_present():
         return None
     try:
-        threshold = clustering_threshold(len(audio) / 16000.0)
-        log(f"diarisation : seuil de regroupement {threshold:.2f} "
-            f"({len(audio) / 16000.0 / 60.0:.0f} min d'audio).")
-        cfg = so.OfflineSpeakerDiarizationConfig(
-            segmentation=so.OfflineSpeakerSegmentationModelConfig(
-                pyannote=so.OfflineSpeakerSegmentationPyannoteModelConfig(model=DIAR_SEG_PATH)),
-            embedding=so.SpeakerEmbeddingExtractorConfig(
-                model=DIAR_EMB_PATH, num_threads=CPU_THREADS),
-            clustering=so.FastClusteringConfig(
-                num_clusters=(num_speakers if num_speakers and num_speakers > 0 else -1),
-                threshold=threshold),
-            min_duration_on=0.3, min_duration_off=0.5)
-        sd = so.OfflineSpeakerDiarization(cfg)
         audio = np.asarray(audio, dtype=np.float32)
-
-        def _cb(*a):
-            # sherpa appelle (n_traité, n_total[, arg]) ; on remonte une progression 0-100.
-            if progress is not None and len(a) >= 2 and a[1]:
-                try:
-                    progress(min(100, int(a[0] / a[1] * 100)))
-                except Exception:
-                    pass
-            return 0
-
-        segments = sd.process(audio, callback=_cb).sort_by_start_time()
-        return drop_micro_speakers([(s.start, s.end, s.speaker) for s in segments])
+        threshold = clustering_threshold(len(audio) / 16000.0)
+        minutes = len(audio) / 16000.0 / 60.0
+        plafond = num_speakers if 0 < num_speakers <= DIAR_MAX_CONSTRAINED else 0
+        log(f"diarisation : seuil de regroupement {threshold:.2f} ({minutes:.0f} min "
+            f"d'audio, plafond {plafond or 'aucun'}).")
+        diar = merge_adjacent_turns(
+            drop_micro_speakers(_diarize_once(so, audio, -1, threshold, progress)))
+        if plafond:
+            diar = enforce_speaker_cap(audio, diar, plafond)
+        return diar
     except Exception as e:
         log(f"diarize : {e}")
         return None
@@ -1359,6 +1601,55 @@ def _speaker_at(start, end, diar):
     return nearest
 
 
+# Mise en paragraphes d'une réunion. Un horodatage toutes les trois secondes rend une
+# transcription d'une heure illisible ; un horodatage par paragraphe la rend consultable.
+# La règle n'utilise aucun modèle : un blanc dans la parole, ou une phrase terminée dans
+# un paragraphe déjà long, suffisent à décider.
+PARAGRAPH_GAP_S = 2.0        # blanc entre deux passages qui ouvre un paragraphe
+PARAGRAPH_MAX_CHARS = 600    # au-delà, on coupe à la première phrase terminée
+SILENCE_MARK_S = 20.0        # blanc signalé explicitement dans le texte
+STRONG_PUNCT = ".!?…"
+
+
+def _paragraph_break(prev_seg, gap, current_len):
+    """True si un nouveau paragraphe doit s'ouvrir avant le passage courant."""
+    if prev_seg is None:
+        return False
+    if gap >= PARAGRAPH_GAP_S:
+        return True
+    return (current_len >= PARAGRAPH_MAX_CHARS
+            and prev_seg.text.strip()[-1:] in STRONG_PUNCT)
+
+
+def _flush_paragraph(lines, buffer, start, timestamps):
+    if not buffer:
+        return
+    prefix = f"[{fmt_ts(start)}] " if timestamps else ""
+    lines.append(prefix + " ".join(buffer))
+
+
+def format_paragraphs(seglist, timestamps=False, offset=0.0):
+    """Texte d'une réunion SANS séparation des locuteurs, en paragraphes lisibles."""
+    lines, buffer, para_start, prev = [], [], 0.0, None
+    for s in seglist:
+        txt = s.text.strip()
+        if not txt:
+            continue
+        start = s.start + offset
+        gap = start - (prev.end + offset) if prev is not None else 0.0
+        if _paragraph_break(prev, gap, sum(len(b) + 1 for b in buffer)):
+            _flush_paragraph(lines, buffer, para_start, timestamps)
+            if gap >= SILENCE_MARK_S:
+                lines.append(f"[silence de {fmt_duration(gap)}]")
+            buffer, para_start = [], start
+        elif not buffer:
+            para_start = start
+        buffer.append(txt)
+        prev = s
+    _flush_paragraph(lines, buffer, para_start, timestamps)
+    return "\n\n".join(lines).strip()
+
+
 def format_with_speakers(seglist, diar, timestamps=False, offset=0.0):
     """Assemble le texte en préfixant chaque prise de parole par « — Locuteur N : » quand
     le locuteur change. `seglist` = segments faster-whisper (.start/.end/.text) ; `diar` =
@@ -1366,21 +1657,31 @@ def format_with_speakers(seglist, diar, timestamps=False, offset=0.0):
     None si `diar` est vide (l'appelant garde alors le rendu habituel)."""
     if not diar:
         return None
-    lines = []
-    current = object()   # sentinelle : garantit un en-tête au tout premier segment
-    for s in seglist:
-        txt = s.text.strip()
-        if not txt:
-            continue
-        spk = _speaker_at(s.start + offset, s.end + offset, diar)
-        if spk != current:
-            current = spk
-            label = f"Locuteur {spk + 1}" if spk is not None else "Locuteur ?"
-            if lines:
-                lines.append("")          # ligne vide entre deux locuteurs (lisibilité)
-            lines.append(f"— {label} :")
-        prefix = f"[{fmt_ts(s.start + offset)}] " if timestamps else ""
-        lines.append(f"{prefix}{txt}")
+    usable = [s for s in seglist if s.text.strip()]
+    if not usable:
+        return None
+    speakers = smooth_speaker_flips(
+        [_speaker_at(s.start + offset, s.end + offset, diar) for s in usable])
+    lines, buffer, para_start, prev = [], [], 0.0, None
+    current = object()   # sentinelle : garantit un en-tête au tout premier passage
+    for s, spk in zip(usable, speakers):
+        start = s.start + offset
+        gap = start - (prev.end + offset) if prev is not None else 0.0
+        changed = (spk != current)
+        if changed or _paragraph_break(prev, gap, sum(len(b) + 1 for b in buffer)):
+            _flush_paragraph(lines, buffer, para_start, timestamps)
+            buffer, para_start = [], start
+            if changed:
+                current = spk
+                label = f"Locuteur {spk + 1}" if spk is not None else "Locuteur ?"
+                if lines:
+                    lines.append("")      # ligne vide entre deux locuteurs (lisibilité)
+                lines.append(f"— {label} :")
+        elif not buffer:
+            para_start = start
+        buffer.append(s.text.strip())
+        prev = s
+    _flush_paragraph(lines, buffer, para_start, timestamps)
     return "\n".join(lines).strip()
 
 
@@ -2194,7 +2495,7 @@ class VoixFlashApp(rumps.App):
                 pass
 
     # ------------------------------------------------------------ audio I/O --
-    def _make_audio_cb(self, sink, disk_queue, ready=None):
+    def _make_audio_cb(self, sink, disk_queue, ready=None, channels=1):
         """Fabrique le callback audio d'UN flux précis.
 
         Le callback écrit dans la liste `sink` qui lui est propre, et non dans
@@ -2208,8 +2509,14 @@ class VoixFlashApp(rumps.App):
         def cb(indata, _frames, _time_info, status):
             if status:
                 log(f"audio status: {status}")
-            # Copie nécessaire : le tampon est réutilisé par PortAudio.
-            buf = indata.copy()
+            if channels > 1:
+                # Mélange des canaux, en int32 pour que la somme ne déborde pas avant
+                # la division. Une copie est produite au passage, donc le tampon de
+                # PortAudio n'est pas retenu.
+                buf = (indata.astype(np.int32).sum(axis=1) // channels).astype(np.int16)
+            else:
+                # Copie nécessaire : le tampon est réutilisé par PortAudio.
+                buf = indata.copy()
             sink.append(buf)
             if ready is not None and not ready.is_set():
                 ready.set()       # simple drapeau : rien de coûteux ici
@@ -2258,52 +2565,63 @@ class VoixFlashApp(rumps.App):
         ready = threading.Event()
         if self.config.get("sounds_enabled", True):
             threading.Thread(target=self._announce_ready, args=(ready,), daemon=True).start()
+        # Combinaisons essayées dans l'ordre. 16 kHz d'abord (CoreAudio convertit
+        # proprement et on évite tout rééchantillonnage) ; puis la fréquence native du
+        # micro ; puis le mono, au cas où c'est l'ouverture à deux canaux qui gêne le
+        # pilote. La dernière tentative reproduit exactement le comportement d'origine,
+        # donc aucun périphérique qui marchait ne peut cesser de marcher.
+        chans = input_channel_count()
         try:
-            self._record_sr = 16000
-            self._stream = sd.InputStream(samplerate=16000, channels=1, dtype="int16",
-                                          callback=self._make_audio_cb(frames, disk_q, ready))
-            self._stream.start()
-            log(f"Enregistrement démarré ({mode}, 16000 Hz).")
-            return True
-        except Exception as e:
-            log(f"16 kHz indisponible ({e}) — repli sur la fréquence par défaut du micro.")
-            # Si le flux 16 kHz a été OUVERT (constructeur réussi) mais que .start() a
-            # échoué, il faut le refermer : sinon le périphérique reste ouvert (micro
-            # « chaud ») et on en ouvrirait un second juste après. Fuite de ressource.
-            if self._stream is not None:
-                try:
-                    self._stream.close()
-                except Exception:
-                    pass
-                self._stream = None
+            native_sr = int(sd.query_devices(kind="input")["default_samplerate"])
+        except Exception:
+            native_sr = 48000
+        attempts = [(16000, chans), (native_sr, chans)]
+        if chans > 1:
+            attempts += [(16000, 1), (native_sr, 1)]
+        seen, ordered = set(), []
+        for combo in attempts:
+            if combo not in seen:
+                seen.add(combo)
+                ordered.append(combo)
+
+        last_error = None
+        for sr, nch in ordered:
             try:
-                info = sd.query_devices(kind="input")
-                self._record_sr = int(info["default_samplerate"])
-            except Exception:
-                self._record_sr = 48000
-            # La sauvegarde disque a été ouverte en annonçant 16 kHz : on corrige la
-            # fiche, sinon une réunion récupérée serait relue à la mauvaise vitesse.
-            if self._disk_paths is not None:
-                save_json(self._disk_paths[1], {"sr": int(self._record_sr),
-                                                "started": datetime.datetime.now().isoformat(
-                                                    timespec="seconds"),
-                                                "version": APP_VERSION})
-            try:
+                self._record_sr = sr
                 self._stream = sd.InputStream(
-                    samplerate=self._record_sr, channels=1, dtype="int16",
-                    callback=self._make_audio_cb(frames, disk_q, ready))
+                    samplerate=sr, channels=nch, dtype="int16",
+                    callback=self._make_audio_cb(frames, disk_q, ready, channels=nch))
                 self._stream.start()
-                log(f"Enregistrement démarré ({mode}, {self._record_sr} Hz, repli).")
+                # La sauvegarde disque a été ouverte en annonçant 16 kHz : on corrige la
+                # fiche, sinon une réunion récupérée serait relue à la mauvaise vitesse.
+                if sr != 16000 and self._disk_paths is not None:
+                    save_json(self._disk_paths[1],
+                              {"sr": sr,
+                               "started": datetime.datetime.now().isoformat(timespec="seconds"),
+                               "version": APP_VERSION})
+                log(f"Enregistrement démarré ({mode}, {sr} Hz, {nch} canal/canaux).")
                 return True
-            except Exception as e2:
-                log(f"Impossible d'ouvrir le micro : {e2}")
-                self._discard_disk_backup(self._stop_disk_backup())
-                with self._lock:
-                    self._recording = False
-                    self._record_mode = None
-                self._ui_queue.put(("error", "Impossible d'accéder au micro. Autorise le « Microphone » dans les réglages, puis « Redémarrer VoixFlash »."))
-                self._ui_queue.put(("state", "idle"))
-                return False
+            except Exception as e:
+                last_error = e
+                log(f"micro indisponible en {sr} Hz / {nch} canal(aux) : {e}")
+                # Si le constructeur a réussi mais que .start() a échoué, il faut
+                # refermer : sinon le périphérique reste ouvert (micro « chaud ») et
+                # la tentative suivante en ouvrirait un second. Fuite de ressource.
+                if self._stream is not None:
+                    try:
+                        self._stream.close()
+                    except Exception:
+                        pass
+                    self._stream = None
+
+        log(f"Impossible d'ouvrir le micro : {last_error}")
+        self._discard_disk_backup(self._stop_disk_backup())
+        with self._lock:
+            self._recording = False
+            self._record_mode = None
+        self._ui_queue.put(("error", "Impossible d'accéder au micro. Autorise le « Microphone » dans les réglages, puis « Redémarrer VoixFlash »."))
+        self._ui_queue.put(("state", "idle"))
+        return False
 
     def _stop_recording(self):
         """Arrête l'enregistrement. Retourne IMMÉDIATEMENT.
@@ -2500,6 +2818,26 @@ class VoixFlashApp(rumps.App):
                 self._ui_queue.put(("state", "idle"))
                 return
 
+            # Route audio morte : le flux s'est ouvert, il a livré des blocs, et ces
+            # blocs ne contiennent que des zéros parfaits. Ce n'est pas du silence,
+            # c'est un micro qui n'existe pas là où on l'a cherché (canal muet d'une
+            # interface, périphérique virtuel créé par un appel en cours, AirPods
+            # restés en écoute seule). Sans ce contrôle, Whisper invente une phrase
+            # sur le néant et l'utilisateur ne comprend pas d'où elle sort.
+            if audio_is_dead(audio):
+                log(f"Signal strictement nul sur {len(audio) / 16000.0:.1f} s : "
+                    "route audio morte.")
+                # La sauvegarde ne contient que des zéros : la conserver reviendrait à
+                # reproposer un enregistrement vide à chaque démarrage.
+                self._discard_disk_backup(backup)
+                self._ui_queue.put(("error",
+                                    "Le micro n'a rien capté du tout (signal vide). "
+                                    "Vérifie l'entrée choisie dans Réglages Système › Son, "
+                                    "et qu'aucune autre application (visio, appel) ne "
+                                    "l'accapare. L'enregistrement n'a pas été transcrit."))
+                self._ui_queue.put(("state", "idle"))
+                return
+
             with self._lock:
                 model = self.model
             if model is None:
@@ -2551,7 +2889,14 @@ class VoixFlashApp(rumps.App):
                 # La diarisation ne doit JAMAIS faire perdre la transcription : toute erreur
                 # ici (config, modèle, mémoire) retombe silencieusement sur le texte simple.
                 try:
-                    diar = diarize(audio, int(self.config.get("diarization_speakers", 0)))
+                    attendus = int(self.config.get("diarization_speakers", 0))
+                    if attendus == 1:
+                        # « J'étais seul » : lancer la séparation ne peut que fabriquer
+                        # des interlocuteurs imaginaires. On ne la lance pas du tout.
+                        log("diarisation : 1 seul locuteur attendu, séparation ignorée.")
+                        diar = None
+                    else:
+                        diar = diarize(audio, attendus)
                     diar_text = format_with_speakers(
                         seglist, diar, timestamps=bool(self.config["meeting_timestamps"]))
                 except Exception as e:
@@ -2560,10 +2905,11 @@ class VoixFlashApp(rumps.App):
 
             if diar_text is not None:
                 text = diar_text
-            elif mode == "meeting" and self.config["meeting_timestamps"]:
-                # L'horodatage est fourni gratuitement par faster-whisper (start de
-                # chaque segment) : on l'ajoute seulement si l'option est activée.
-                text = "\n".join(f"[{fmt_ts(s.start)}] {s.text.strip()}" for s in seglist).strip()
+            elif mode == "meeting":
+                # Réunion sans séparation des locuteurs : mise en paragraphes, avec au
+                # plus un horodatage par paragraphe si l'option est activée.
+                text = format_paragraphs(
+                    seglist, timestamps=bool(self.config["meeting_timestamps"]))
             else:
                 text = " ".join(s.text.strip() for s in seglist).strip()
 
@@ -3361,8 +3707,11 @@ class VoixFlashApp(rumps.App):
         timestamps = bool(self.config.get("meeting_timestamps"))
         beam = int(self.config.get("beam_size", 5))
         vocab = load_vocabulary()           # lu une fois : un import peut durer longtemps
-        sep = "\n" if timestamps else " "   # défini AVANT la boucle : réutilisé même en cas
-        cancelled = False                   # d'exception (sauvetage des blocs déjà faits)
+        # Les blocs sortent déjà en paragraphes : on les recolle comme deux paragraphes
+        # voisins. Défini AVANT la boucle, car il resert en cas d'exception (sauvetage
+        # des blocs déjà transcrits).
+        sep = "\n\n"
+        cancelled = False
         try:
             with self._lock:
                 model = self.model
@@ -3389,13 +3738,8 @@ class VoixFlashApp(rumps.App):
                 if forced_lang is None and getattr(info, "language", None):
                     forced_lang = info.language
 
-                if timestamps:
-                    # Horodatage réaligné sur la position du bloc dans le fichier complet.
-                    block = "\n".join(
-                        f"[{fmt_ts(s.start + start_sec)}] {s.text.strip()}"
-                        for s in seglist).strip()
-                else:
-                    block = " ".join(s.text.strip() for s in seglist).strip()
+                # Horodatage réaligné sur la position du bloc dans le fichier complet.
+                block = format_paragraphs(seglist, timestamps=timestamps, offset=start_sec)
 
                 if is_probably_hallucination(block):
                     block = ""              # bloc parasite (silence) : ignoré, pas tout le texte
