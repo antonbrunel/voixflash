@@ -201,6 +201,7 @@ DEFAULT_CONFIG = {
     "sounds_enabled": True,      # petits sons au début et à la fin d'une dictée
     "handsfree_enabled": False,  # appui bref = dictée mains libres (au lieu d'annuler)
     "paste_trailing_space": False,  # ajouter une espace après le texte collé
+    "export_markdown": False,    # exporter en .md (titre + date) plutôt qu'en .txt brut
 }
 
 # Attente maximale du moteur au moment de transcrire, quand un chargement est en cours
@@ -1297,6 +1298,71 @@ def history_clear():
         return False
 
 
+FRENCH_DAYS = ("lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche")
+FRENCH_MONTHS = ("janvier", "février", "mars", "avril", "mai", "juin", "juillet",
+                 "août", "septembre", "octobre", "novembre", "décembre")
+
+
+def parse_ts(ts):
+    """Date d'une entrée d'historique, ou None si l'horodatage est illisible."""
+    try:
+        return datetime.datetime.fromisoformat(ts)
+    except Exception:
+        return None
+
+
+def day_label(ts, today=None):
+    """« Aujourd'hui », « Hier », ou « lundi 8 septembre ».
+
+    Une liste d'entrées horodatées à la seconde ne se lit pas. Regroupée par jour,
+    elle se parcourt : on cherche presque toujours « ce que j'ai dicté ce matin »."""
+    moment = parse_ts(ts)
+    if moment is None:
+        return "Date inconnue"
+    today = today or datetime.date.today()
+    jours = (today - moment.date()).days
+    if jours == 0:
+        return "Aujourd'hui"
+    if jours == 1:
+        return "Hier"
+    libelle = (f"{FRENCH_DAYS[moment.weekday()]} {moment.day} "
+               f"{FRENCH_MONTHS[moment.month - 1]}")
+    return libelle if moment.year == today.year else f"{libelle} {moment.year}"
+
+
+def clock_label(ts):
+    """Heure seule (« 14:32 ») : le jour est déjà porté par l'en-tête du groupe."""
+    moment = parse_ts(ts)
+    return moment.strftime("%H:%M") if moment else "--:--"
+
+
+def search_excerpt(text, query, width=100):
+    """Extrait du texte autour du premier terme trouvé, plutôt que son tout début.
+
+    Sans cela, un résultat de recherche affiche les premiers mots de l'entrée, qui
+    n'ont en général rien à voir avec ce qu'on cherchait : on ne sait pas si le
+    résultat est le bon avant de l'avoir ouvert."""
+    flat = " ".join((text or "").split())
+    if not flat:
+        return ""
+    terms = [t for t in (query or "").split() if any(c.isalnum() for c in t)]
+    plie = strip_accents(flat).lower()
+    position = -1
+    for term in terms:
+        found = plie.find(strip_accents(term).lower())
+        if found != -1 and (position == -1 or found < position):
+            position = found
+    if position == -1 or len(flat) <= width:
+        return flat[:width] + ("…" if len(flat) > width else "")
+    start = max(0, position - width // 3)
+    # On recule jusqu'à une frontière de mot : couper au milieu d'un mot se lit mal.
+    if start > 0:
+        espace = flat.rfind(" ", 0, start + 1)
+        start = espace + 1 if espace != -1 else start
+    fragment = flat[start:start + width]
+    return ("…" if start > 0 else "") + fragment + ("…" if start + width < len(flat) else "")
+
+
 def history_search(query, limit=30):
     """Recherche plein-texte dans l'historique. Renvoie les entrées correspondantes,
     les plus pertinentes d'abord (FTS5), ou les plus récentes en repli (LIKE)."""
@@ -1933,8 +1999,11 @@ class VoixFlashApp(rumps.App):
 
         self.import_item = rumps.MenuItem(IMPORT_IDLE_TITLE, callback=self.import_audio_file)
         self.reunions_menu.add(self.import_item)
-        self.reunions_menu.add(rumps.MenuItem("Exporter la dernière réunion (.txt)",
+        self.reunions_menu.add(rumps.MenuItem("Exporter la dernière réunion",
                                               callback=self.export_last_meeting))
+        self.md_item = rumps.MenuItem("Exporter en markdown (titre et date)",
+                                      callback=self.toggle_markdown)
+        self.reunions_menu.add(self.md_item)
         self.reunions_menu.add(self.ts_item)
         # Séparation des locuteurs : bascule (installe le module à la 1re activation) +
         # sous-menu « Locuteurs attendus ». Placés sous une séparation pour les distinguer.
@@ -1957,6 +2026,7 @@ class VoixFlashApp(rumps.App):
         self.hesit_item.state = bool(self.config.get("remove_hesitations", True))
         self.sound_item.state = bool(self.config.get("sounds_enabled", True))
         self.space_item.state = bool(self.config.get("paste_trailing_space"))
+        self.md_item.state = bool(self.config.get("export_markdown"))
         self.handsfree_item.state = bool(self.config.get("handsfree_enabled"))
 
         # Sous-menu d'aide : guide complet en tête, puis liens vers les réglages macOS.
@@ -2026,20 +2096,33 @@ class VoixFlashApp(rumps.App):
         self.history_menu.add(self.search_results_menu)
         self._fill_search_results()
         self.history_menu.add(rumps.separator)
-        recent = history_recent(15)   # les 15 plus récentes (la plus récente d'abord)
+        recent = history_recent(20)   # les 20 plus récentes (la plus récente d'abord)
         if not recent:
             self.history_menu.add(rumps.MenuItem("(vide)"))
         else:
+            # Groupées par jour : un en-tête sans callback est grisé par macOS, ce qui
+            # en fait exactement un intertitre.
+            jour_courant = None
             for i, entry in enumerate(recent):
+                jour = day_label(entry.get("ts", ""))
+                if jour != jour_courant:
+                    jour_courant = jour
+                    if i:
+                        self.history_menu.add(rumps.separator)
+                    self.history_menu.add(rumps.MenuItem(jour))
                 preview = " ".join((entry.get("text") or "").split())
-                if len(preview) > 44:
-                    preview = preview[:44] + "…"
+                if len(preview) > 40:
+                    preview = preview[:40] + "…"
                 tag = "Réunion" if entry.get("mode") == "meeting" else "Dictée"
-                # Le numéro garantit un titre unique (les menus rumps sont indexés par titre).
-                title = f"{i + 1}.  {tag} · {preview}"
+                # Les menus rumps sont indexés par titre : deux dictées de la même
+                # minute au même contenu tronqué s'écraseraient l'une l'autre. On rend
+                # le titre unique par des espaces de largeur nulle, invisibles à
+                # l'écran, plutôt que par un numéro qui n'apprend rien au lecteur.
+                title = (f"   {clock_label(entry.get('ts', ''))}   {tag} · {preview}"
+                         + "​" * i)
                 self.history_menu.add(rumps.MenuItem(title, callback=self._make_history_cb(entry["id"])))
         self.history_menu.add(rumps.separator)
-        self.history_menu.add(rumps.MenuItem("Exporter tout l'historique (.txt)",
+        self.history_menu.add(rumps.MenuItem("Exporter tout l'historique",
                                              callback=self.export_all_history))
         self.history_menu.add(rumps.MenuItem("Vider l'historique…", callback=self.clear_history))
 
@@ -2204,12 +2287,12 @@ class VoixFlashApp(rumps.App):
             return
         self.search_results_menu.add(rumps.separator)
         for i, entry in enumerate(self._search_results):
-            preview = " ".join((entry.get("text") or "").split())
-            if len(preview) > 44:
-                preview = preview[:44] + "…"
+            # Extrait pris AUTOUR du terme cherché : le début de l'entrée n'a en
+            # général rien à voir avec ce qu'on cherchait.
+            excerpt = search_excerpt(entry.get("text"), self._search_query, width=70)
             tag = "Réunion" if entry.get("mode") == "meeting" else "Dictée"
-            # Le numéro garantit un titre unique (menus rumps indexés par titre).
-            title = f"{i + 1}.  {tag} · {preview}"
+            title = (f"{day_label(entry.get('ts', ''))} {clock_label(entry.get('ts', ''))}"
+                     f"   {tag} · {excerpt}" + "​" * i)
             self.search_results_menu.add(
                 rumps.MenuItem(title, callback=self._make_history_cb(entry["id"])))
 
@@ -4158,6 +4241,11 @@ class VoixFlashApp(rumps.App):
         if self.config["sounds_enabled"]:
             self._sounds.play("start")   # aperçu immédiat du son choisi
 
+    def toggle_markdown(self, sender):
+        self.config["export_markdown"] = not self.config.get("export_markdown")
+        sender.state = self.config["export_markdown"]
+        save_json(CONFIG_PATH, self.config)
+
     def toggle_paste_space(self, sender):
         self.config["paste_trailing_space"] = not self.config.get("paste_trailing_space")
         sender.state = self.config["paste_trailing_space"]
@@ -4459,13 +4547,30 @@ class VoixFlashApp(rumps.App):
             return
         self._export_entry_txt(entry, prefix="reunion")
 
+    @staticmethod
+    def _markdown_export(entry):
+        """Transcription en markdown, avec un en-tête daté.
+
+        Trois lignes de plus, et le fichier devient exploitable tel quel dans un outil
+        de notes : il porte son titre et sa date au lieu d'être un bloc de texte nu
+        qu'il faut retrouver par son nom de fichier."""
+        mode = entry.get("mode", "flash")
+        titre = "Réunion" if mode == "meeting" else "Dictée"
+        ts = entry.get("ts", "")
+        moment = parse_ts(ts)
+        date = (f"{day_label(ts)} {clock_label(ts)}" if moment else ts)
+        return f"# {titre}\n\n## {date}\n\n{entry.get('text', '')}\n"
+
     def _export_entry_txt(self, entry, prefix="transcription"):
-        """Écrit le texte d'une entrée dans un .txt daté et le révèle dans le Finder."""
+        """Écrit le texte d'une entrée dans un fichier daté et le révèle dans le Finder."""
         stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
-        path = os.path.join(TRANSCRIPTS_DIR, f"{prefix}_{stamp}.txt")
+        markdown = bool(self.config.get("export_markdown"))
+        path = os.path.join(TRANSCRIPTS_DIR,
+                            f"{prefix}_{stamp}.{'md' if markdown else 'txt'}")
         try:
             with open(path, "w", encoding="utf-8") as f:
-                f.write(entry.get("text", ""))
+                f.write(self._markdown_export(entry) if markdown
+                        else entry.get("text", ""))
             self._run([OPEN, "-R", path])   # révèle le fichier dans le Finder
             self._show_info("Exporté", f"Fichier créé :\n{path}")
         except Exception as e:
@@ -4480,12 +4585,32 @@ class VoixFlashApp(rumps.App):
             self._show_info("VoixFlash", "L'historique est vide.")
             return
         stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
-        path = os.path.join(TRANSCRIPTS_DIR, f"historique_{stamp}.txt")
+        markdown = bool(self.config.get("export_markdown"))
+        path = os.path.join(TRANSCRIPTS_DIR,
+                            f"historique_{stamp}.{'md' if markdown else 'txt'}")
         try:
             with open(path, "w", encoding="utf-8") as f:
+                if markdown:
+                    maintenant = datetime.datetime.now().isoformat(timespec="seconds")
+                    f.write(f"# Historique {APP_NAME}\n\n"
+                            f"## Exporté {day_label(maintenant)} "
+                            f"à {clock_label(maintenant)}\n\n")
+                jour = None
                 for e in entries:
-                    tag = "RÉUNION" if e.get("mode") == "meeting" else "DICTÉE"
-                    f.write(f"--- {e.get('ts', '')}  [{tag}] ---\n{e.get('text', '')}\n\n")
+                    if markdown:
+                        # Groupé par jour, comme le menu : un export d'un an ne se lit
+                        # pas autrement.
+                        courant = day_label(e.get("ts", ""))
+                        if courant != jour:
+                            jour = courant
+                            f.write(f"\n### {courant}\n\n")
+                        tag = "Réunion" if e.get("mode") == "meeting" else "Dictée"
+                        f.write(f"**{clock_label(e.get('ts', ''))} · {tag}**\n\n"
+                                f"{e.get('text', '')}\n\n")
+                    else:
+                        tag = "RÉUNION" if e.get("mode") == "meeting" else "DICTÉE"
+                        f.write(f"--- {e.get('ts', '')}  [{tag}] ---\n"
+                                f"{e.get('text', '')}\n\n")
             self._run([OPEN, path])
             self._show_info("Exporté", f"Historique exporté ({len(entries)} entrées) :\n{path}")
         except Exception as e:

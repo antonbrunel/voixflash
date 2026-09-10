@@ -54,6 +54,13 @@
   démarre et attend le moteur, au lieu de répondre « le moteur se charge encore ».
 - **Un seul moteur en mémoire à la fois.** Changer de qualité construisait le nouveau
   moteur avant de libérer l'ancien : les deux coexistaient le temps du chargement.
+- **Historique groupé par jour** (Aujourd'hui, Hier, puis la date), avec l'heure de
+  chaque entrée. Une liste horodatée à la seconde ne se parcourt pas ; on cherche
+  presque toujours « ce que j'ai dicté ce matin ».
+- **Les résultats de recherche montrent le passage trouvé**, pas les premiers mots de
+  l'entrée. On ne savait pas si un résultat était le bon avant de l'avoir ouvert.
+- **Export en markdown**, en option : le fichier porte son titre et sa date, et
+  l'export complet de l'historique est groupé par jour.
 
 - **Journal de diagnostic audio**, dans un fichier à part. Il répond à une seule
   question : le micro a-t-il vraiment délivré du son, et quand. Chaque capture y laisse
