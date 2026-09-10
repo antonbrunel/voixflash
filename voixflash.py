@@ -202,6 +202,7 @@ DEFAULT_CONFIG = {
     "handsfree_enabled": False,  # appui bref = dictée mains libres (au lieu d'annuler)
     "paste_trailing_space": False,  # ajouter une espace après le texte collé
     "export_markdown": False,    # exporter en .md (titre + date) plutôt qu'en .txt brut
+    "diarize_imports": False,    # séparer aussi les locuteurs des fichiers importés
 }
 
 # Attente maximale du moteur au moment de transcrire, quand un chargement est en cours
@@ -847,6 +848,63 @@ def tidy_spacing(text):
     return text.strip()
 
 
+# ------------------------------------------------ nommage des locuteurs --
+# Les en-têtes produits par format_with_speakers. On travaille sur le texte enregistré
+# plutôt que sur une couche de correspondances à part : le texte EST le document, il
+# n'est jamais re-généré à partir de l'audio (qui, lui, est effacé), donc il n'y a rien
+# qu'une retranscription pourrait venir écraser.
+SPEAKER_LINE_RE = re.compile(r"^—\s*(.+?)\s*:\s*$", re.MULTILINE)
+
+
+def detect_speaker_labels(text):
+    """Étiquettes de locuteurs présentes dans un texte, dans l'ordre d'apparition."""
+    seen, out = set(), []
+    for match in SPEAKER_LINE_RE.finditer(text or ""):
+        label = match.group(1)
+        if label not in seen:
+            seen.add(label)
+            out.append(label)
+    return out
+
+
+def _collapse_speaker_runs(text):
+    """Fusionne deux blocs voisins attribués au même locuteur.
+
+    Nécessaire après un renommage : donner le même nom à deux étiquettes est la façon
+    dont on FUSIONNE deux locuteurs, et sans ce nettoyage on verrait « — Marie : »
+    deux fois de suite avec une ligne vide au milieu."""
+    lignes = (text or "").split("\n")
+    out, dernier = [], None
+    for ligne in lignes:
+        match = SPEAKER_LINE_RE.match(ligne)
+        if match:
+            if match.group(1) == dernier:
+                # Même locuteur qu'au-dessus : on retire aussi la ligne vide de
+                # séparation qu'on venait d'écrire.
+                while out and not out[-1].strip():
+                    out.pop()
+                continue
+            dernier = match.group(1)
+        out.append(ligne)
+    return "\n".join(out)
+
+
+def rename_speakers(text, mapping):
+    """Renomme les locuteurs d'une transcription. Deux noms identiques = fusion.
+
+    C'est volontairement le même geste : « qui est Locuteur 3 ? » et « Locuteur 3 et
+    Locuteur 5, c'est la même personne » sont la même question posée deux fois, et
+    l'utilisateur y répond en donnant deux fois le même nom."""
+    if not text or not mapping:
+        return text
+
+    def _remplace(match):
+        ancien = match.group(1)
+        return f"— {mapping.get(ancien, ancien)} :"
+
+    return _collapse_speaker_runs(SPEAKER_LINE_RE.sub(_remplace, text))
+
+
 def load_vocabulary():
     """Lit le vocabulaire de l'utilisateur (mots à faire respecter, corrections)."""
     data = load_json(VOCAB_PATH, None)
@@ -1265,6 +1323,21 @@ def history_last_meeting():
     except Exception as e:
         log(f"history_last_meeting : {e}")
         return None
+
+
+def history_update_text(entry_id, text):
+    """Remplace le texte d'une entrée existante (nommage des locuteurs).
+
+    C'est le SEUL endroit qui modifie une entrée sur place. La modification manuelle du
+    texte, elle, crée une nouvelle entrée : on ne veut pas perdre l'original. Nommer un
+    locuteur est différent — c'est la même transcription, mieux étiquetée."""
+    try:
+        with _hist_db() as conn:
+            conn.execute("UPDATE entries SET text = ? WHERE id = ?", (text, entry_id))
+        return True
+    except Exception as e:
+        log(f"history_update_text : {e}")
+        return False
 
 
 def history_delete(entry_id):
@@ -1697,6 +1770,78 @@ def diarize(audio, num_speakers=0, progress=None):
         return None
 
 
+# En deçà de cette distance, deux empreintes sont considérées comme la même personne.
+# Choisi sous le minimum mesuré entre deux voix DIFFÉRENTES du même enregistrement
+# (0,51) : on préfère créer un locuteur de trop plutôt que fondre deux personnes.
+SAME_SPEAKER_MAX = 0.45
+
+
+class SpeakerRegistry:
+    """Garde l'identité des locuteurs d'un bloc de fichier au suivant.
+
+    Un fichier importé est transcrit par blocs pour que la mémoire reste bornée, et
+    chaque bloc est séparé indépendamment : son « Locuteur 1 » n'a aucune raison d'être
+    celui du bloc précédent. Sans ce registre, un fichier d'une heure produirait une
+    trentaine de locuteurs qui sont en réalité trois personnes.
+
+    On rapproche donc chaque voix d'un bloc des voix déjà connues par leur empreinte.
+    Le centroïde connu est mis à jour au passage, pondéré par le temps de parole : une
+    voix entendue pendant vingt minutes ne se laisse pas déplacer par un bloc de dix
+    secondes."""
+
+    def __init__(self, threshold=SAME_SPEAKER_MAX):
+        self.threshold = threshold
+        self.centroids = []      # [(vecteur normalisé, poids en secondes)]
+
+    def assign(self, local_centroids, weights=None):
+        """Rend {locuteur local: locuteur global} et met le registre à jour."""
+        mapping = {}
+        weights = weights or {}
+        # Les voix les plus présentes d'abord : ce sont elles qui doivent revendiquer
+        # une identité connue, pas un « oui » de trois secondes.
+        for local in sorted(local_centroids, key=lambda s: -weights.get(s, 0.0)):
+            vector = local_centroids[local]
+            poids = max(weights.get(local, 1.0), 1e-6)
+            best, best_distance = None, None
+            for index, (known, _) in enumerate(self.centroids):
+                if index in mapping.values():
+                    continue     # une voix déjà revendiquée dans CE bloc
+                distance = 1.0 - float(np.dot(vector, known))
+                if best_distance is None or distance < best_distance:
+                    best, best_distance = index, distance
+            if best is not None and best_distance <= self.threshold:
+                mapping[local] = best
+                known, known_weight = self.centroids[best]
+                melange = known * known_weight + vector * poids
+                self.centroids[best] = (
+                    melange / (float(np.linalg.norm(melange)) + 1e-9),
+                    known_weight + poids)
+            else:
+                mapping[local] = len(self.centroids)
+                self.centroids.append((vector, poids))
+        return mapping
+
+
+def diarize_block(audio, registry, num_speakers=0):
+    """Sépare les locuteurs d'UN bloc et réconcilie leurs identités avec les blocs
+    précédents. Renvoie la liste (début, fin, locuteur GLOBAL), ou None."""
+    diar = diarize(audio, num_speakers=num_speakers)
+    if not diar:
+        return None
+    centroids = speaker_centroids(audio, diar)
+    if not centroids:
+        # Sans empreintes, on ne peut RIEN affirmer sur la continuité des identités
+        # entre blocs. Mieux vaut renoncer que numéroter au hasard.
+        log("blocs : empreintes indisponibles, identités non réconciliées.")
+        return None
+    weights = {}
+    for start, end, spk in diar:
+        weights[spk] = weights.get(spk, 0.0) + max(0.0, end - start)
+    mapping = registry.assign(centroids, weights)
+    return [(start, end, mapping.get(spk, spk)) for start, end, spk in diar
+            if spk in mapping]
+
+
 def _speaker_at(start, end, diar):
     """Locuteur (int) dont l'intervalle recouvre le plus [start, end].
 
@@ -2013,6 +2158,14 @@ class VoixFlashApp(rumps.App):
         self.reunions_menu.add(self.diar_item)
         self.diar_speakers_menu = rumps.MenuItem("Locuteurs attendus")
         self.reunions_menu.add(self.diar_speakers_menu)
+        self.diar_import_item = rumps.MenuItem(
+            "Séparer aussi les fichiers importés", callback=self.toggle_diar_imports)
+        self.reunions_menu.add(self.diar_import_item)
+        # Accessible depuis le menu, et pas seulement depuis la fenêtre de résultat :
+        # une longue réunion s'ouvre dans TextEdit, où il n'y a plus de bouton.
+        self.reunions_menu.add(rumps.MenuItem(
+            "Nommer les locuteurs de la dernière réunion…",
+            callback=self.name_last_meeting_speakers))
         self._diar_installing = False
 
         # Remplissage des sous-menus
@@ -4085,6 +4238,13 @@ class VoixFlashApp(rumps.App):
     def _estimate_import_minutes(self, duration_seconds):
         """Estimation lisible du temps de transcription (≈ durée × facteur du modèle)."""
         factor = IMPORT_RT_FACTOR.get(self.config.get("model", "small"), 0.25)
+        # La séparation des locuteurs s'ajoute à la transcription : mesurée sur cette
+        # pile à 0,24 fois la durée de l'audio. L'annoncer évite de faire passer pour
+        # un blocage un traitement qui dure simplement deux fois plus longtemps.
+        if (self.config.get("diarization_enabled")
+                and self.config.get("diarize_imports")
+                and diarization_models_present()):
+            factor += 0.24
         secs = max(1, int(duration_seconds * factor))
         if secs < 90:
             return f"{secs} s"
@@ -4108,6 +4268,13 @@ class VoixFlashApp(rumps.App):
         # des blocs déjà transcrits).
         sep = "\n\n"
         cancelled = False
+        plafond = int(self.config.get("diarization_speakers", 0))
+        registry = None
+        if (self.config.get("diarization_enabled")
+                and self.config.get("diarize_imports")
+                and plafond != 1 and diarization_ready()):
+            registry = SpeakerRegistry()
+            log("Import : séparation des locuteurs activée (bloc par bloc).")
         try:
             with self._lock:
                 model = self.model
@@ -4136,8 +4303,28 @@ class VoixFlashApp(rumps.App):
                 if forced_lang is None and getattr(info, "language", None):
                     forced_lang = info.language
 
+                # Séparation des locuteurs bloc par bloc, avec réconciliation des
+                # identités par empreinte : sans elle, le « Locuteur 1 » du bloc 2
+                # n'aurait aucune raison d'être celui du bloc 1, et un fichier d'une
+                # heure produirait une trentaine de locuteurs pour trois personnes.
+                block = None
+                if registry is not None:
+                    try:
+                        diar = diarize_block(audio, registry, plafond)
+                        if diar:
+                            # La séparation travaille en temps LOCAL au bloc ; on la
+                            # décale sur la position du bloc pour que l'horodatage
+                            # affiché reste celui du fichier complet.
+                            diar = [(s + start_sec, e + start_sec, spk)
+                                    for s, e, spk in diar]
+                            block = format_with_speakers(
+                                seglist, diar, timestamps=timestamps, offset=start_sec)
+                    except Exception as e:
+                        log(f"séparation du bloc ignorée (repli sur texte simple) : {e}")
                 # Horodatage réaligné sur la position du bloc dans le fichier complet.
-                block = format_paragraphs(seglist, timestamps=timestamps, offset=start_sec)
+                if block is None:
+                    block = format_paragraphs(seglist, timestamps=timestamps,
+                                              offset=start_sec)
 
                 if is_probably_hallucination(block):
                     block = ""              # bloc parasite (silence) : ignoré, pas tout le texte
@@ -4353,12 +4540,39 @@ class VoixFlashApp(rumps.App):
     def _refresh_diar_menu(self):
         """Coche l'état de la diarisation et (re)construit le sous-menu « Locuteurs attendus »."""
         self.diar_item.state = bool(self.config.get("diarization_enabled"))
+        self.diar_import_item.state = bool(self.config.get("diarize_imports"))
         self._safe_clear(self.diar_speakers_menu)
         current = int(self.config.get("diarization_speakers", 0))
         for label, val in DIAR_SPEAKER_CHOICES:
             item = rumps.MenuItem(label, callback=self._make_diar_speakers_cb(val))
             item.state = (current == val)
             self.diar_speakers_menu.add(item)
+
+    def toggle_diar_imports(self, sender):
+        """Étend la séparation des locuteurs aux fichiers importés.
+
+        Coûteux et donc explicite : la séparation ajoute environ un quart de la durée
+        de l'audio au temps de traitement, en plus de la transcription."""
+        new = not bool(self.config.get("diarize_imports"))
+        self.config["diarize_imports"] = new
+        sender.state = new
+        save_json(CONFIG_PATH, self.config)
+        if new and not self.config.get("diarization_enabled"):
+            self._show_info(
+                "À activer d'abord",
+                "La séparation des locuteurs elle-même n'est pas activée : ce réglage "
+                "restera sans effet tant que « Séparer les locuteurs (réunions) » ne "
+                "l'est pas.")
+        elif new:
+            self._show_info(
+                "Fichiers importés séparés",
+                "Les fichiers que tu importes distingueront maintenant les locuteurs.\n\n"
+                "Compte environ un quart de la durée de l'audio EN PLUS du temps de "
+                "transcription : une heure d'enregistrement demande une quinzaine de "
+                "minutes supplémentaires.\n\n"
+                "Le fichier est traité par blocs pour ménager la mémoire, et les voix "
+                "sont reconnues d'un bloc à l'autre : « Locuteur 2 » désigne bien la "
+                "même personne du début à la fin.")
 
     def _make_diar_speakers_cb(self, val):
         def cb(_sender):
@@ -4652,6 +4866,7 @@ class VoixFlashApp(rumps.App):
             return
         try:
             app_to_front()
+            a_des_locuteurs = bool(detect_speaker_labels(original))
             win = rumps.Window(
                 title=f"Transcription · {kind}",
                 message=f"{ts}\n\nModifie le texte si besoin, puis choisis une action.",
@@ -4659,17 +4874,24 @@ class VoixFlashApp(rumps.App):
                 ok="Fermer",                                  # bouton 1 (à droite)
                 dimensions=(480, 360),
             )
-            win.add_button("Copier")                          # bouton 2
-            win.add_button("Enregistrer les modifications")   # bouton 3
-            if entry_id is not None:
-                win.add_button("Supprimer")                   # bouton 4
+            # Les boutons sont numérotés dans l'ordre d'ajout, à partir de 2 : leur
+            # numéro dépend donc de ceux qu'on ajoute ou non. On le retient au lieu de
+            # l'écrire en dur, sinon « Supprimer » absent décale tout le reste.
+            boutons = {}
+            for libelle in (["Copier", "Enregistrer les modifications"]
+                            + (["Supprimer"] if entry_id is not None else [])
+                            + (["Nommer les locuteurs"] if a_des_locuteurs else [])):
+                win.add_button(libelle)
+                boutons[libelle] = len(boutons) + 2
             resp = win.run()
             current = resp.text if resp.text is not None else original
 
-            if resp.clicked == 2:            # Copier (prend en compte les modifications)
+            if resp.clicked == boutons.get("Nommer les locuteurs"):
+                self.name_speakers(entry, current)
+            elif resp.clicked == boutons.get("Copier"):
                 self._set_clipboard(current)
                 self._show_info("Copié", "Le texte a été copié dans le presse-papiers.")
-            elif resp.clicked == 3:          # Enregistrer les modifications
+            elif resp.clicked == boutons.get("Enregistrer les modifications"):
                 if current.strip() and current != original:
                     history_add(mode, current)
                     self._ui_queue.put(("history_changed", None))
@@ -4678,7 +4900,7 @@ class VoixFlashApp(rumps.App):
                 else:
                     self._show_info("Aucune modification",
                                     "Le texte n'a pas changé : rien à enregistrer.")
-            elif resp.clicked == 4:          # Supprimer
+            elif resp.clicked == boutons.get("Supprimer"):
                 if entry_id is not None and self._confirm(
                         "Supprimer définitivement cette entrée de l'historique ?",
                         ok="Supprimer"):
@@ -4686,6 +4908,55 @@ class VoixFlashApp(rumps.App):
                     self._ui_queue.put(("history_changed", None))
         except Exception as e:
             log(f"fenêtre transcription : {e}")
+
+    def name_speakers(self, entry, text):
+        """Demande un nom pour chaque locuteur, l'un après l'autre.
+
+        Deux locuteurs qui reçoivent le MÊME nom sont fusionnés : c'est la demande la
+        plus fréquente face à une voix découpée en deux, et elle n'a pas besoin d'une
+        interface de plus. Rien n'est enregistré tant que tous les noms n'ont pas été
+        parcourus : fermer ou annuler en cours de route ne laisse pas un document à
+        moitié renommé."""
+        labels = detect_speaker_labels(text)
+        if not labels:
+            self._show_info("Aucun locuteur",
+                            "Cette transcription ne distingue pas les locuteurs.")
+            return None
+        mapping = {}
+        for index, label in enumerate(labels, 1):
+            saisi = self._vocab_prompt(
+                f"Nommer les locuteurs ({index}/{len(labels)})",
+                f"Quel est le vrai nom de « {label} » ?\n\n"
+                "Laisse vide pour ne pas y toucher.\n\n"
+                "Astuce : donne le MÊME nom à deux locuteurs pour les fusionner, quand "
+                "une seule personne a été découpée en plusieurs voix.",
+                placeholder=label)
+            if saisi is None:
+                return None            # annulé : on ne touche à rien
+            if saisi and saisi != label:
+                mapping[label] = saisi
+        if not mapping:
+            self._show_info("Rien à changer", "Aucun nom n'a été modifié.")
+            return None
+        nouveau = rename_speakers(text, mapping)
+        entry_id = entry.get("id")
+        if entry_id is not None:
+            history_update_text(entry_id, nouveau)
+            self._ui_queue.put(("history_changed", None))
+        fusions = len(mapping) - len(set(mapping.values()))
+        detail = f"\n\n{fusions} locuteur·s fusionné·s." if fusions > 0 else ""
+        self._show_info("Locuteurs nommés",
+                        "\n".join(f"« {a} » devient « {b} »" for a, b in mapping.items())
+                        + detail)
+        return nouveau
+
+    def name_last_meeting_speakers(self, _sender):
+        """Nomme les locuteurs de la dernière réunion, depuis le menu."""
+        entry = history_last_meeting()
+        if not entry or not (entry.get("text") or "").strip():
+            self._show_info("VoixFlash", "Aucune réunion dans l'historique.")
+            return
+        self.name_speakers(entry, entry.get("text", ""))
 
     def _show_long_transcript(self, entry, text, kind, ts):
         """Longue transcription : on l'écrit dans un .txt daté et on propose de

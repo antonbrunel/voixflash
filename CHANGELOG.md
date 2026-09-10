@@ -61,6 +61,18 @@
   l'entrée. On ne savait pas si un résultat était le bon avant de l'avoir ouvert.
 - **Export en markdown**, en option : le fichier porte son titre et sa date, et
   l'export complet de l'historique est groupé par jour.
+- **Les fichiers importés peuvent séparer les locuteurs**, ce qui n'était pas possible
+  jusqu'ici. Le fichier reste traité par blocs pour ménager la mémoire, et les voix sont
+  reconnues d'un bloc à l'autre par leur empreinte : « Locuteur 2 » désigne la même
+  personne du début à la fin. Sans cette réconciliation, un fichier d'une heure aurait
+  produit une trentaine de locuteurs pour trois personnes. À activer dans « Réunions »,
+  et l'estimation de durée annoncée avant le lancement en tient compte.
+- **Nommer les locuteurs.** « Locuteur 3 » devient « Marie », dans toute la
+  transcription. Donner le MÊME nom à deux locuteurs les fusionne, et les blocs voisins
+  qui se retrouvent attribués à la même personne sont recollés : c'est la réponse à une
+  voix découpée en deux. Depuis la fenêtre d'une transcription, ou depuis « Réunions ›
+  Nommer les locuteurs de la dernière réunion… » pour les longues réunions qui s'ouvrent
+  dans TextEdit.
 
 - **Journal de diagnostic audio**, dans un fichier à part. Il répond à une seule
   question : le micro a-t-il vraiment délivré du son, et quand. Chaque capture y laisse
