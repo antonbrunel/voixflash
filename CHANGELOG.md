@@ -54,6 +54,12 @@
   démarre et attend le moteur, au lieu de répondre « le moteur se charge encore ».
 - **Un seul moteur en mémoire à la fois.** Changer de qualité construisait le nouveau
   moteur avant de libérer l'ancien : les deux coexistaient le temps du chargement.
+- **Repères posés en direct.** Pendant une réunion, la touche de dictée ne servait à
+  rien : elle pose maintenant un repère sur l'instant courant, avec un son de
+  confirmation. Tous les repères sont listés en tête de la transcription finale. Sans
+  modèle de langue, c'est le seul moyen honnête de produire des chapitres : c'est
+  l'humain qui sait ce qui compte. « Réunions › Poser un repère… » permet d'y joindre
+  un mot.
 - **Historique groupé par jour** (Aujourd'hui, Hier, puis la date), avec l'heure de
   chaque entrée. Une liste horodatée à la seconde ne se parcourt pas ; on cherche
   presque toujours « ce que j'ai dicté ce matin ».
@@ -73,7 +79,6 @@
   voix découpée en deux. Depuis la fenêtre d'une transcription, ou depuis « Réunions ›
   Nommer les locuteurs de la dernière réunion… » pour les longues réunions qui s'ouvrent
   dans TextEdit.
-
 - **Journal de diagnostic audio**, dans un fichier à part. Il répond à une seule
   question : le micro a-t-il vraiment délivré du son, et quand. Chaque capture y laisse
   l'ouverture du périphérique, le délai du premier bloc réellement reçu, un battement

@@ -22,11 +22,16 @@ Aucun compte, aucun abonnement, aucune clé. Ta voix ne quitte jamais ton Mac.
   sur **CPU uniquement**, rien n'est envoyé sur internet.
 - **Léger et discret** : vit dans la barre des menus, quasi invisible au repos.
 - **Accents français impeccables** : collage via le presse-papiers (jamais lettre par lettre).
-- **Séparation des locuteurs** (réunions) : option à activer d'un clic — affiche « — Locuteur 1 :
-  … », « — Locuteur 2 : … ». Télécharge un petit module local une seule fois (~50 Mo, depuis
-  GitHub, **sans compte ni clé**) ; tout reste sur ton Mac.
-- **Historique** local (dictées + réunions), copiable et exportable, avec **recherche plein-texte**
-  (mots-clés, accents ignorés).
+- **Séparation des locuteurs** : option à activer d'un clic — affiche « — Locuteur 1 :
+  … », « — Locuteur 2 : … », en réunion **et** sur les fichiers importés. Télécharge un petit
+  module local une seule fois (~50 Mo, depuis GitHub, **sans compte ni clé**) ; tout reste sur
+  ton Mac. Tu peux ensuite **nommer** les locuteurs, et en **fusionner** deux quand une seule
+  personne a été découpée en plusieurs voix.
+- **Repères en direct** : pendant une réunion, ta touche de dictée pose un repère sur
+  l'instant courant. Ils sont listés en tête de la transcription.
+- **Historique** local (dictées + réunions) groupé par jour, copiable et exportable en `.txt`
+  ou en markdown, avec **recherche plein-texte** (mots-clés, accents ignorés) qui affiche le
+  passage trouvé.
 - **Réglages simples** : qualité/vitesse, langue (FR/EN), touche de dictée.
 - **Vocabulaire personnalisé** : tes noms propres et ton jargon écrits correctement, sans
   intelligence artificielle supplémentaire ni ralentissement.
@@ -93,7 +98,11 @@ Puis clique **« Redémarrer VoixFlash »**.
 
 - **Dictée éclair** : maintiens la touche (par défaut **Option droite**), attends le petit son
   qui confirme que le micro écoute, parle, relâche. **Échap** annule la dictée en cours.
+  Si le texte ne s'est pas collé, icône › **« Recoller la dernière dictée »**.
+  Mode **mains libres** en option : un appui bref verrouille la capture, on parle sans rien
+  tenir, un nouvel appui arrête.
 - **Réunion** : icône › **« Démarrer une réunion »** … **« Arrêter la réunion »**.
+  Pendant la réunion, ta touche de dictée **pose un repère** sur l'instant courant.
 - **Importer un fichier audio** : icône › **Réunions › « Importer un fichier audio… »** →
   choisis un fichier audio ou vidéo. La langue est détectée automatiquement, la progression
   s'affiche dans le menu, et l'item devient **« Annuler la transcription en cours »** si tu
@@ -114,8 +123,12 @@ Tout le reste (comportement du presse-papiers, limites, historique…) est déta
 - **Durée / mémoire** : les fichiers sont **découpés en blocs** et décodés en flux → la
   mémoire reste stable même sur **2 h et plus**. Au-delà de 30 min, une estimation du temps
   est proposée avant de lancer ; au-delà de 3 h, une confirmation est demandée.
-- **Limites** : pas de séparation des locuteurs (texte continu) ; fichiers **protégés (DRM)**
-  refusés ; une seule transcription à la fois (import, réunion ou dictée).
+- **Séparation des locuteurs** : possible sur les fichiers importés (« Réunions › Séparer
+  aussi les fichiers importés »). Compte environ **un quart de la durée de l'audio en plus**
+  du temps de transcription. Le fichier reste traité par blocs, et les voix sont reconnues
+  d'un bloc à l'autre : « Locuteur 2 » désigne la même personne du début à la fin.
+- **Limites** : fichiers **protégés (DRM)** refusés ; une seule transcription à la fois
+  (import, réunion ou dictée).
 
 ---
 
@@ -127,16 +140,22 @@ Tout le reste (comportement du presse-papiers, limites, historique…) est déta
 | **Langue** | **Français** (défaut), **Anglais**, ou **Automatique** (détecte la langue à chaque dictée — idéal pour alterner FR/EN). |
 | **Touche de dictée** | Préréglages (Option droite par défaut, Cmd droite, Ctrl droite, F5) **ou « Choisir ma touche… »** : appuie sur la touche que tu veux, elle est captée telle quelle (fiable quel que soit le clavier). |
 | **Réunions › Importer un fichier audio…** | Transcrit un fichier audio/vidéo existant comme une réunion (langue auto, découpage automatique, progression + annulation). |
-| **Réunions › Horodatage** | Ajoute `[mm:ss]` devant chaque passage (réunions **et** imports). |
+| **Réunions › Horodatage** | Ajoute `[mm:ss]` en tête de chaque paragraphe (réunions **et** imports), pas devant chaque phrase. |
+| **Réunions › Locuteurs attendus** | Un **plafond**, jamais un minimum : empêche de découper une voix en plusieurs, ne force jamais à fusionner. « 1 » = j'étais seul, la séparation ne tourne pas. |
+| **Réunions › Séparer aussi les fichiers importés** | Étend la séparation aux imports (coûte ~25 % de la durée de l'audio en plus). |
+| **Réunions › Exporter en markdown** | Le fichier exporté porte un titre et une date ; l'historique complet est groupé par jour. |
+| **Touche de dictée › Mains libres** | Un appui bref verrouille la capture au lieu de l'ignorer. À éviter sur une touche modificatrice, qu'on effleure souvent. |
 | **Texte dicté › Vocabulaire** | Ajoute les noms propres, marques et termes métier tels que tu veux les voir. Les variantes approchantes sont corrigées, même quand le moteur découpe le mot (*voie flash* → *VoixFlash*). Corrections exactes possibles, utilisables aussi comme raccourcis de saisie. |
 | **Texte dicté › Retirer les hésitations** | Efface les « euh » et « hmm » du texte (activé). |
+| **Texte dicté › Ajouter une espace après le texte collé** | Évite que deux dictées enchaînées se collent bord à bord (désactivé). |
 | **Restaurer le presse-papiers** | Remet ton ancien presse-papiers après une dictée (activé), avec toutes ses données (image, texte enrichi, fichiers). |
+| **Recoller la dernière dictée** | Filet de rattrapage quand un collage a échoué sans message. |
 
 ---
 
 ## 📁 Où sont mes fichiers ?
 
-- Réglages, historique, journal : `~/Library/Application Support/VoixFlash/`
+- Réglages, historique, journaux : `~/Library/Application Support/VoixFlash/`
 - Transcriptions exportées (`.txt` datés) : `~/Documents/VoixFlash Transcriptions/`
 
 ---
@@ -152,7 +171,14 @@ et ses fichiers sont supprimés. Tes transcriptions `.txt` déjà exportées son
 
 - **Rien ne s'écrit en dictée éclair** → vérifie **Accessibilité** *et* **Surveillance des
   entrées**, puis **Redémarrer VoixFlash**.
-- **Pas de son capté** → vérifie **Microphone**.
+- **La touche ne répond plus alors qu'elle marchait** → **Aide & autorisations › « La touche
+  de dictée ne répond plus ? »**. Indice : si Option marche encore mais que F5 ne fait rien,
+  c'est la **saisie sécurisée** de macOS (un champ mot de passe ouvert quelque part).
+- **Pas de son capté** → vérifie **Microphone**. Si VoixFlash annonce que le micro n'a *rien*
+  capté, c'est l'entrée elle-même qui est en cause : regarde **Réglages Système › Son**, et
+  vérifie qu'aucune visio n'accapare le micro.
+- **Pour demander de l'aide** → **Aide & autorisations › « Copier les informations système »**
+  prépare un bloc à coller dans ton message (sans aucun texte dicté).
 - **Je ne vois pas l'icône** → sur un MacBook, elle peut se cacher derrière l'encoche ; réduis
   le nombre d'icônes de la barre.
 - **« Ce fichier ne contient pas de piste audio lisible »** → format non reconnu, fichier
@@ -166,7 +192,9 @@ et ses fichiers sont supprimés. Tes transcriptions `.txt` déjà exportées son
 ## 🔒 Vie privée
 
 Tout est **local**. Après l'installation, aucune donnée audio ni texte ne sort de ton Mac.
-Aucun compte, aucune télémétrie.
+Aucun compte, aucune télémétrie. **Le texte que tu dictes n'est jamais journalisé** : le
+journal de diagnostic audio ne contient que des compteurs techniques (le micro a-t-il livré
+du son, et quand), sur une fenêtre de sept jours.
 
 ---
 

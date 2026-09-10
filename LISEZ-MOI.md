@@ -58,14 +58,22 @@ Le plus simple : clique sur l'icône VoixFlash dans la barre des menus ›
 
 > **Échap** pendant que tu parles annule la dictée : rien n'est écrit. Un simple effleurement
 > de la touche ne dicte rien non plus.
+> Si le texte ne s'est pas collé, icône › **« Recoller la dernière dictée »**.
+> **Mains libres** (à activer dans *Touche de dictée*) : un appui bref verrouille la capture,
+> tu parles sans rien tenir, un nouvel appui arrête. La mention « mains libres » s'affiche
+> à côté de l'icône tant que ça tourne.
 
 ### Réunion / enregistrement long
 1. Clique l'icône VoixFlash › **« Démarrer une réunion »**.
 2. Parle aussi longtemps que tu veux (l'icône montre l'état « enregistre » : le micro tourne).
 3. Clique **« Arrêter la réunion »**. Le texte complet s'affiche dans une fenêtre, où tu peux
    le lire, le modifier, le **Copier** ou le **Supprimer**.
-4. Pour le garder en fichier : menu › **Réunions › « Exporter la dernière réunion (.txt) »**
+4. Pour le garder en fichier : menu › **Réunions › « Exporter la dernière réunion »**
    → un fichier daté est créé dans `~/Documents/VoixFlash Transcriptions`.
+
+> **Repères** : pendant une réunion, ta touche de dictée ne dicte pas — elle **pose un repère**
+> sur l'instant courant, avec un petit son de confirmation. Tous les repères sont listés en
+> tête de la transcription. **Réunions › « Poser un repère… »** permet d'y joindre un mot.
 
 > En réunion, le presse-papiers n'est **pas** touché tout seul (copie via le bouton).
 > En dictée éclair, ton presse-papiers est préservé (si du texte) puis remis en place.
@@ -81,8 +89,9 @@ Le plus simple : clique sur l'icône VoixFlash dans la barre des menus ›
 
 > Tout se fait sur le processeur : compte ~15 min pour 1 h d'audio en qualité « small »
 > (plus lent en « medium »). Les fichiers longs (**2 h et plus**) sont découpés tout seuls,
-> donc la mémoire reste stable. La séparation des locuteurs ne concerne **que les réunions
-> enregistrées en direct** (voir Réglages), pas l'import ; fichiers protégés (DRM) refusés.
+> donc la mémoire reste stable. La séparation des locuteurs peut aussi s'appliquer aux
+> imports (**Réunions › Séparer aussi les fichiers importés**) : compte alors **un quart de
+> la durée de l'audio en plus**. Fichiers protégés (DRM) refusés.
 
 ### Indicateur d'état (barre des menus)
 L'icône (un micro blanc) change de **forme** : micro fin = chargement · micro plein = prêt ·
@@ -90,7 +99,8 @@ pastille d'enregistrement = enregistre · forme d'onde = transcrit · presse-pap
 
 ### Historique
 - Toutes les transcriptions (dictées, réunions **et imports de fichiers**) s'ajoutent au menu
-  **« Historique récent »**. **Clique une entrée** pour la rouvrir (lire, modifier, copier, supprimer).
+  **« Historique récent »**, **groupées par jour** (Aujourd'hui, Hier, puis la date).
+  **Clique une entrée** pour la rouvrir (lire, modifier, copier, supprimer, nommer les locuteurs).
 - **Rechercher** : **Historique récent › 🔍 Rechercher…** — tape un ou plusieurs mots-clés
   (accents et majuscules ignorés) ; les correspondances apparaissent dans **« Résultats de
   recherche »**, cliquables.
@@ -114,13 +124,22 @@ pastille d'enregistrement = enregistre · forme d'onde = transcrit · presse-pap
 - **Texte dicté › Retirer les hésitations** : efface les « euh » et « hmm » (activé).
 - **Réunions › Importer un fichier audio…** : transcrit un fichier audio/vidéo existant
   (langue auto, découpage automatique, progression, annulable).
-- **Réunions › Horodatage des passages** : ajoute `[mm:ss]` devant chaque passage (réunions et imports).
+- **Réunions › Horodatage des passages** : ajoute `[mm:ss]` en tête de chaque **paragraphe**
+  (réunions et imports), et non devant chaque phrase.
+- **Réunions › Exporter en markdown** : le fichier exporté porte un titre et une date.
 - **Réunions › Séparer les locuteurs** : affiche « — Locuteur 1 : … », « — Locuteur 2 : … »
   dans tes réunions. La **1re activation** télécharge un petit module (~50 Mo, depuis GitHub,
-  **sans compte ni clé**) ; ensuite tout est hors-ligne. **Réunions › Locuteurs attendus** :
-  laisse **Automatique**, ou indique le nombre de personnes **seulement si tu en es sûr**
-  (un nombre trop grand découpe une vraie voix en plusieurs). La séparation fonctionne bien
-  sur des voix distinctes et se dégrade quand plusieurs parlent en même temps.
+  **sans compte ni clé**) ; ensuite tout est hors-ligne. **Réunions › Locuteurs attendus**
+  est un **plafond**, jamais un minimum : il empêche de découper une voix en plusieurs, mais
+  ne force jamais à en fusionner. Choisis **1** si tu étais seul (la séparation ne tourne
+  alors pas du tout), sinon laisse **Automatique**. La séparation fonctionne bien sur des
+  voix distinctes et se dégrade quand plusieurs parlent en même temps.
+- **Nommer les locuteurs** : dans la fenêtre d'une transcription, bouton **« Nommer les
+  locuteurs »** (ou **Réunions › « Nommer les locuteurs de la dernière réunion… »**).
+  « Locuteur 3 » devient « Marie » partout. Donne le **même nom** à deux locuteurs pour les
+  **fusionner** : c'est la réparation à faire quand une seule personne a été découpée en deux.
+- **Texte dicté › Ajouter une espace après le texte collé** : évite que deux dictées
+  enchaînées se collent bord à bord (désactivé).
 - **Restaurer le presse-papiers après une dictée** : remet ton ancien presse-papiers (activé).
 
 > Le **1er choix** d'une qualité télécharge le modèle une fois (jusqu'à ~1 min pour
@@ -141,6 +160,14 @@ conservées dans `~/Documents/VoixFlash Transcriptions`.
 
 - Rien ne s'écrit en dictée éclair → vérifie **Accessibilité** *et* **Surveillance des
   entrées**, puis **Redémarrer VoixFlash**.
-- Pas de son capté → vérifie **Microphone**.
+- La touche ne répond plus alors qu'elle marchait → **Aide & autorisations › « La touche de
+  dictée ne répond plus ? »**. Indice : si Option marche encore mais que F5 ne fait rien,
+  c'est la **saisie sécurisée** de macOS (un champ mot de passe ouvert quelque part).
+- Pas de son capté → vérifie **Microphone**. Si VoixFlash annonce que le micro n'a **rien**
+  capté, c'est l'entrée elle-même : regarde **Réglages Système › Son**, et vérifie qu'aucune
+  visio n'accapare le micro.
 - L'icône est introuvable → sur un MacBook, elle peut se cacher derrière l'encoche.
-- Journal technique : `~/Library/Application Support/VoixFlash/voixflash.log`.
+- Pour demander de l'aide → **Aide & autorisations › « Copier les informations système »**
+  prépare un bloc à coller dans ton message. Il ne contient **aucun texte dicté**.
+- Journaux techniques : `~/Library/Application Support/VoixFlash/voixflash.log` et
+  `diagnostic.log` (compteurs audio seulement, jamais ce que tu dictes, sur 7 jours).

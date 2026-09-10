@@ -2006,6 +2006,7 @@ class VoixFlashApp(rumps.App):
         self._captured = None             # dernière touche captée pendant la capture
         self._stream = None               # flux audio en cours
         self._audio_stats = None          # compteurs livrés par le moteur audio
+        self._meeting_marks = []          # repères posés pendant la réunion en cours
         self._frames = []                 # morceaux audio enregistrés
         self._record_sr = 16000           # fréquence d'échantillonnage utilisée
         self._record_start = None         # début de l'enregistrement (garde-fou durée)
@@ -2166,6 +2167,8 @@ class VoixFlashApp(rumps.App):
         self.reunions_menu.add(rumps.MenuItem(
             "Nommer les locuteurs de la dernière réunion…",
             callback=self.name_last_meeting_speakers))
+        self.reunions_menu.add(rumps.MenuItem("Poser un repère…",
+                                              callback=self.place_marker_menu))
         self._diar_installing = False
 
         # Remplissage des sous-menus
@@ -2740,6 +2743,55 @@ class VoixFlashApp(rumps.App):
         except Exception as e:
             log(f"réarmement de l'écoute : {e}")
 
+    # ------------------------------------------------- repères d'une réunion --
+    def _place_marker(self, note=""):
+        """Note l'instant courant d'une réunion. Sûr depuis n'importe quel thread."""
+        start = self._record_start
+        if start is None:
+            return None
+        moment = max(0.0, time.monotonic() - start)
+        self._meeting_marks.append((moment, (note or "").strip()))
+        log(f"Repère posé à {fmt_ts(moment)}"
+            + (f" : {len(note)} caractères de note" if note else ""))
+        diag("repere", seconde=round(moment, 1), note=("oui" if note else "non"))
+        if self.config.get("sounds_enabled", True):
+            self._sounds.play("start")     # confirmation, sans regarder l'écran
+        return moment
+
+    def place_marker_menu(self, _sender):
+        """« Poser un repère » depuis le menu, avec une note facultative."""
+        with self._lock:
+            en_reunion = self._recording and self._record_mode == "meeting"
+        if not en_reunion:
+            self._show_info("Aucune réunion en cours",
+                            "Les repères se posent pendant une réunion, pour retrouver "
+                            "un passage important dans la transcription.\n\n"
+                            f"Pendant une réunion, la touche « {self._current_hotkey_label()} » "
+                            "en pose un directement, sans ouvrir de fenêtre.")
+            return
+        note = self._vocab_prompt(
+            "Poser un repère",
+            "L'instant est déjà noté. Tu peux ajouter un mot pour le retrouver "
+            "(« décision », « chiffres », « à revoir »), ou laisser vide.")
+        moment = self._place_marker(note or "")
+        if moment is not None:
+            self._show_info("Repère posé",
+                            f"Noté à {fmt_ts(moment)} depuis le début de la réunion.")
+
+    @staticmethod
+    def _markers_summary(marks):
+        """En-tête « Repères » listant les instants notés à la main.
+
+        Placé en tête de la transcription : c'est ce qu'on cherche en premier quand on
+        rouvre une réunion d'une heure, et le reste du texte est trop long pour qu'on
+        le parcoure à la recherche d'un passage dont on sait qu'il existe."""
+        if not marks:
+            return ""
+        lignes = ["— Repères posés pendant la réunion :"]
+        for moment, note in marks:
+            lignes.append(f"  [{fmt_ts(moment)}]" + (f"  {note}" if note else ""))
+        return "\n".join(lignes) + "\n\n"
+
     def _reset_ptt(self):
         """Repart d'un état de touche propre : plus rien de tenu, plus de mains libres.
 
@@ -2809,7 +2861,13 @@ class VoixFlashApp(rumps.App):
                 return
             if not key_matches(key, self._hotkey):
                 return
-            if self._recording:               # une réunion est déjà en cours
+            if self._recording:
+                # Une réunion est en cours : la touche de dictée ne servait à rien
+                # pendant ce temps. Elle pose maintenant un repère sur l'instant
+                # courant, ce qui est le seul moyen honnête de produire des chapitres
+                # sans modèle de langue : c'est l'humain qui sait ce qui est important.
+                if self._record_mode == "meeting":
+                    self._place_marker()
                 return
             if self._transcribing:            # un import/une transcription tourne déjà
                 self._ui_queue.put(("error", "Une transcription est déjà en cours, réessaie dans un instant."))
@@ -3035,6 +3093,7 @@ class VoixFlashApp(rumps.App):
         # (une dictée éclair dure quelques secondes, il n'y a rien à sauver).
         disk_q = None
         if mode == "meeting":
+            self._meeting_marks = []
             self._start_disk_backup(16000)
             disk_q = self._disk_queue
         ready = threading.Event()
@@ -3407,6 +3466,12 @@ class VoixFlashApp(rumps.App):
             else:
                 text = " ".join(s.text.strip() for s in seglist).strip()
 
+            # Repères posés à la main pendant la réunion, en tête du document. On les
+            # relève AVANT le nettoyage : ce sont nos horodatages, pas du texte reconnu,
+            # et ils n'ont rien à faire dans la correction de vocabulaire.
+            marks = self._meeting_marks if mode == "meeting" else []
+            self._meeting_marks = []
+
             # Garde-fou anti-hallucination (silence/bruit) : on n'écrit rien.
             if is_probably_hallucination(text):
                 log(f"Transcription écartée (probable hallucination) : {text!r}")
@@ -3440,6 +3505,8 @@ class VoixFlashApp(rumps.App):
                                                  f"ou silence).{garde}"))
                 self._ui_queue.put(("state", "idle"))
                 return
+
+            text = self._markers_summary(marks) + text
 
             # Écriture en base depuis ce thread de fond : history_add ouvre sa propre
             # connexion SQLite, c'est sûr. On demande ensuite au thread principal de
@@ -5001,6 +5068,12 @@ class VoixFlashApp(rumps.App):
         ts_state = "activé" if self.config.get("meeting_timestamps") else "désactivé"
         hesit_state = "activé" if self.config.get("remove_hesitations", True) else "désactivé"
         sound_state = "activé" if self.config.get("sounds_enabled", True) else "désactivé"
+        hf_state = "activé" if self.config.get("handsfree_enabled") else "désactivé"
+        md_state = "markdown (.md)" if self.config.get("export_markdown") else "texte (.txt)"
+        plafond = int(self.config.get("diarization_speakers", 0))
+        plafond_state = "aucune limite" if not plafond else (
+            "1, séparation désactivée" if plafond == 1 else f"{plafond} au plus")
+        imports_state = ("oui" if self.config.get("diarize_imports") else "non")
 
         guide = (
             f"VOIXFLASH {APP_VERSION} — MODE D'EMPLOI COMPLET\n"
@@ -5018,6 +5091,12 @@ class VoixFlashApp(rumps.App):
             "  ÉCHAP pendant que tu parles annule la dictée : rien n'est écrit.\n"
             "  L'enregistrement continue un court instant après le relâchement, pour\n"
             "  ne pas couper ton dernier mot.\n"
+            f"  MAINS LIBRES (actuellement : {hf_state}) : avec ce mode, un appui BREF\n"
+            "  verrouille la capture. Tu parles sans rien tenir, la mention « mains\n"
+            "  libres » s'affiche à côté de l'icône, un nouvel appui arrête, Échap\n"
+            "  annule. Un appui maintenu garde le comportement habituel.\n"
+            "  Si le texte ne s'est pas collé (champ récalcitrant, mauvaise fenêtre\n"
+            "  active), menu › « Recoller la dernière dictée ».\n"
             "\n"
             "• RÉUNION (enregistrement long)\n"
             "  Menu › « Démarrer une réunion ». Parle aussi longtemps que tu veux.\n"
@@ -5027,6 +5106,14 @@ class VoixFlashApp(rumps.App):
             "  interrompue : ce qui est déjà reconnu est gardé.\n"
             "  Une réunion de plus de 4 000 caractères s'ouvre dans TextEdit plutôt\n"
             "  que dans une fenêtre (défilement, recherche, impression).\n"
+            "  REPÈRES : pendant une réunion, ta touche de dictée ne dicte pas (on\n"
+            "  n'est pas en train de dicter) — elle POSE UN REPÈRE sur l'instant\n"
+            "  courant, avec un petit son de confirmation. Tous les repères sont\n"
+            "  listés en tête de la transcription finale, avec leur horodatage :\n"
+            "  c'est ce qu'on cherche en premier en rouvrant une réunion d'une heure.\n"
+            "  « Réunions › Poser un repère… » permet d'y joindre un mot.\n"
+            "  Le texte est mis en PARAGRAPHES, avec au plus un horodatage par\n"
+            "  paragraphe, et les silences de plus de 20 s sont signalés.\n"
             "\n"
             "• RIEN N'EST PERDU\n"
             "  Pendant une réunion, l'audio est écrit sur le disque en continu. Si\n"
@@ -5074,6 +5161,10 @@ class VoixFlashApp(rumps.App):
             "  et mémoire). Au-delà, relance une réunion.\n"
             "• Une dictée éclair dont la touche reste enfoncée plus de 2 MINUTES\n"
             "  s'arrête aussi automatiquement.\n"
+            "• MICRO MUET : si l'entrée audio ne délivre RIEN du tout (canal muet d'une\n"
+            "  interface, périphérique pris par une visio en cours), VoixFlash te le dit\n"
+            "  au lieu de transcrire une phrase inventée sur du vide. Se taire quelques\n"
+            "  secondes reste normal : c'est un signal strictement vide qui est détecté.\n"
             "• SILENCE / BRUIT : si rien d'audible n'est dit, RIEN n'est écrit. Un\n"
             "  filtre écarte aussi les phrases parasites que le moteur invente parfois\n"
             "  sur du silence (ex. « Sous-titres réalisés par… ») : non collées.\n"
@@ -5084,16 +5175,28 @@ class VoixFlashApp(rumps.App):
             "  choisie : « small » ≈ 1 h d'audio en ~15 min ; « medium » est plus lent.\n"
             "  Un fichier de 2 h passe sans souci (découpage automatique). Au-delà de\n"
             "  30 min, un message annonce une estimation avant de lancer.\n"
-            "• L'import ne SÉPARE PAS les locuteurs (c'est un texte continu). La séparation\n"
-            "  « qui parle » n'existe que pour les RÉUNIONS enregistrées en direct (voir la\n"
-            "  section ci-dessous). Les fichiers protégés (DRM, Apple Music) sont refusés.\n"
+            f"• IMPORT ET LOCUTEURS : l'import peut maintenant séparer les locuteurs\n"
+            f"  (« Réunions › Séparer aussi les fichiers importés », actuellement :\n"
+            f"  {imports_state}). Compte environ un QUART de la durée de l'audio EN PLUS\n"
+            "  du temps de transcription. Le fichier est traité par blocs pour ménager\n"
+            "  la mémoire, et les voix sont reconnues d'un bloc à l'autre : « Locuteur 2 »\n"
+            "  désigne bien la même personne du début à la fin.\n"
+            "  Les fichiers protégés (DRM, Apple Music) sont refusés.\n"
             "\n"
-            "• SÉPARER LES LOCUTEURS (réunions) : « Réunions › Séparer les locuteurs »\n"
-            "  télécharge une seule fois un petit module (~50 Mo, depuis GitHub, sans compte)\n"
-            "  et affiche ensuite « — Locuteur 1 : … », « — Locuteur 2 : … » dans tes réunions.\n"
-            "  Tout reste sur ton Mac. Indique le nombre de personnes dans « Locuteurs\n"
-            "  attendus » si tu le connais (sinon « Automatique »). La séparation est fiable\n"
-            "  sur des voix distinctes et se dégrade quand plusieurs parlent en même temps.\n"
+            "• SÉPARER LES LOCUTEURS : « Réunions › Séparer les locuteurs » télécharge une\n"
+            "  seule fois un petit module (~50 Mo, depuis GitHub, sans compte) et affiche\n"
+            "  ensuite « — Locuteur 1 : … », « — Locuteur 2 : … ». Tout reste sur ton Mac.\n"
+            "  La séparation est fiable sur des voix distinctes et se dégrade quand\n"
+            "  plusieurs personnes parlent en même temps.\n"
+            f"  « Locuteurs attendus » (actuellement : {plafond_state}) est un PLAFOND,\n"
+            "  jamais un minimum : il empêche de découper une voix en plusieurs, mais ne\n"
+            "  force jamais à en fusionner. Choisis « 1 » si tu étais seul : la séparation\n"
+            "  ne tourne alors pas du tout. Dans le doute, laisse « Automatique ».\n"
+            "  NOMMER LES LOCUTEURS : dans la fenêtre d'une transcription, bouton\n"
+            "  « Nommer les locuteurs » (ou « Réunions › Nommer les locuteurs de la\n"
+            "  dernière réunion… » pour les longues). « Locuteur 3 » devient « Marie »\n"
+            "  partout. Donne le MÊME nom à deux locuteurs pour les FUSIONNER : c'est la\n"
+            "  réparation à faire quand une seule personne a été découpée en deux voix.\n"
             "• Une seule transcription à la fois : pendant un import ou une réunion, on ne\n"
             "  peut pas en lancer une autre (un message le rappelle).\n"
             "\n"
@@ -5122,14 +5225,19 @@ class VoixFlashApp(rumps.App):
             "━━━ 5. L'HISTORIQUE ━━━\n"
             "\n"
             "• Toutes les transcriptions (éclair ET réunions) s'ajoutent à\n"
-            "  « Historique récent ». Conservé après fermeture (base locale,\n"
+            "  « Historique récent », GROUPÉES PAR JOUR (Aujourd'hui, Hier, puis la\n"
+            "  date), avec l'heure de chacune. Conservé après fermeture (base locale,\n"
             "  1000 dernières entrées).\n"
+            "• La recherche affiche le PASSAGE TROUVÉ, pas le début de l'entrée : tu\n"
+            "  vois tout de suite si c'est le bon résultat. Accents et casse ignorés.\n"
             "• Clique une entrée pour la rouvrir : tu peux la lire, la MODIFIER, puis\n"
             "  « Copier », « Enregistrer les modifications » (cela crée une NOUVELLE\n"
             "  entrée — l'originale n'est pas écrasée) ou « Supprimer ».\n"
-            "• « Réunions › Exporter la dernière réunion (.txt) » et « Exporter tout\n"
-            "  l'historique (.txt) » créent des fichiers DATÉS dans :\n"
+            "• « Réunions › Exporter la dernière réunion » et « Exporter tout\n"
+            "  l'historique » créent des fichiers DATÉS dans :\n"
             "     ~/Documents/VoixFlash Transcriptions\n"
+            f"  Format actuel : {md_state}. « Réunions › Exporter en markdown » ajoute\n"
+            "  un titre et une date au fichier, et groupe l'historique par jour.\n"
             "\n"
             "━━━ 6. LES RÉGLAGES ━━━\n"
             "\n"
@@ -5165,6 +5273,11 @@ class VoixFlashApp(rumps.App):
             "  Le son de départ arrive quand le micro capte VRAIMENT : attends-le avant\n"
             "  de parler, c'est ce qui évite de perdre le premier mot. Rien n'est joué\n"
             "  sur un casque Bluetooth (cela le ferait passer en qualité téléphone).\n"
+            f"• Touche de dictée › Mains libres : appui bref pour verrouiller. Actuel :\n"
+            f"  {hf_state}. Attention si ta touche est un modificateur (Option) : chaque\n"
+            "  effleurement lancerait alors une dictée. Une touche de fonction va mieux.\n"
+            "• Texte dicté › Ajouter une espace après le texte collé : évite que deux\n"
+            "  dictées enchaînées se collent bord à bord.\n"
             "\n"
             "━━━ 7. AUTORISATIONS (à faire une seule fois) ━━━\n"
             "\n"
@@ -5188,8 +5301,17 @@ class VoixFlashApp(rumps.App):
             "Après l'installation, tout fonctionne SANS internet : ta voix ne quitte\n"
             "jamais ton Mac. Aucun compte, aucun abonnement, aucune clé.\n"
             "\n"
-            "Journal technique (en cas de souci) :\n"
-            "   ~/Library/Application Support/VoixFlash/voixflash.log"
+            "Rien n'est jamais journalisé de ce que tu dictes. Le journal de diagnostic\n"
+            "audio ne contient que des compteurs techniques (le micro a-t-il livré du\n"
+            "son, et quand), sur une fenêtre de sept jours.\n"
+            "\n"
+            "En cas de souci, « Aide & autorisations › Copier les informations système »\n"
+            "prépare un bloc à coller dans un message : version, Mac, entrées audio,\n"
+            "réglages, autorisations. Sans aucun texte dicté.\n"
+            "\n"
+            "Journaux techniques :\n"
+            "   ~/Library/Application Support/VoixFlash/voixflash.log\n"
+            "   ~/Library/Application Support/VoixFlash/diagnostic.log"
         )
 
         try:
