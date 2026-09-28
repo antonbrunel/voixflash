@@ -88,12 +88,21 @@ except Exception:
     NSDefaultRunLoopMode = None
     NSRunLoopCommonModes = None
 
+# Empêche la mise en veille automatique du Mac pendant un enregistrement ou une
+# transcription (cf. _keep_awake). Sans lui, un Mac sur batterie laissé sans y
+# toucher s'endort au milieu d'un import de deux heures.
+try:
+    from Foundation import NSProcessInfo, NSActivityUserInitiated
+except Exception:
+    NSProcessInfo = None
+    NSActivityUserInitiated = None
+
 
 # --------------------------------------------------------------------------- #
 #  Chemins & constantes
 # --------------------------------------------------------------------------- #
 APP_NAME = "VoixFlash"
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.6.1"
 LAUNCHD_LABEL = "com.voixflash.agent"   # étiquette du LaunchAgent (cf. install.command)
 APP_HOME = os.path.expanduser(f"~/Library/Application Support/{APP_NAME}")
 CONFIG_PATH = os.path.join(APP_HOME, "config.json")
@@ -680,6 +689,37 @@ except Exception as _e:                      # pyobjc absent ou trop ancien
     WakeObserver = None
 
 
+try:
+    from pynput._util.darwin import keycode_context as _keycode_context
+
+    class KeyListener(keyboard.Listener):
+        """Écoute clavier de pynput, dont la disposition du clavier est lue AVANT le
+        démarrage, sur le thread principal.
+
+        pynput la lit d'origine au début de son propre thread. Sur macOS 26, lire la
+        source de saisie hors du thread principal fait tuer l'app par le système
+        (EXC_BREAKPOINT dans TSMGetInputSourceProperty), sans exception Python ni
+        trace dans le journal. Ça arrivait surtout au réarmement qui suit un réveil
+        du Mac, et coupait net un import ou une réunion en cours."""
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            with _keycode_context() as context:
+                self._main_context = context
+
+        def _run(self):
+            self._context = self._main_context
+            try:
+                # On saute le _run de pynput (celui qui relit la disposition) pour
+                # aller directement à la boucle d'écoute.
+                super(keyboard.Listener, self)._run()
+            finally:
+                self._context = None
+except Exception as _e:                      # autre version de pynput : écoute d'origine
+    log(f"écoute clavier sur mesure indisponible : {_e}")
+    KeyListener = keyboard.Listener
+
+
 class Sounds:
     """Retours sonores, lecteurs préparés une fois pour toutes.
 
@@ -1121,6 +1161,43 @@ def meeting_backup_duration(raw_path, sr):
         return os.path.getsize(raw_path) / (2.0 * max(1, int(sr)))
     except OSError:
         return 0.0
+
+
+def recover_interrupted_imports():
+    """Récupère les imports de fichier coupés net (plantage, coupure de courant).
+
+    Un import réussi, annulé ou en erreur supprime toujours son fichier
+    import_partiel_* : s'il en reste un au démarrage, l'app a été tuée en cours de
+    route. Son texte est versé dans l'historique (donc cherchable), et le fichier
+    est renommé import_interrompu_* pour ne pas être repris deux fois.
+    Renvoie une liste de (chemin du fichier renommé, nombre de mots)."""
+    found = []
+    try:
+        names = sorted(os.listdir(TRANSCRIPTS_DIR))
+    except OSError:
+        return found
+    for name in names:
+        if not (name.startswith("import_partiel_") and name.endswith(".txt")):
+            continue
+        path = os.path.join(TRANSCRIPTS_DIR, name)
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read().strip()
+        except OSError as e:
+            log(f"import interrompu illisible ({name}) : {e}")
+            continue
+        if text and history_add("meeting", text)["id"] is None:
+            continue                    # pas en base : on garde le fichier pour la prochaine fois
+        dest = os.path.join(TRANSCRIPTS_DIR,
+                            "import_interrompu_" + name[len("import_partiel_"):])
+        try:
+            os.replace(path, dest)
+        except OSError as e:
+            log(f"renommage de l'import interrompu : {e}")
+            dest = path
+        log(f"Import interrompu récupéré : {os.path.basename(dest)} ({len(text.split())} mots)")
+        found.append((dest, len(text.split())))
+    return found
 
 
 def find_interrupted_meetings():
@@ -2003,6 +2080,7 @@ class VoixFlashApp(rumps.App):
         self._sounds = Sounds()           # lecteurs préparés une fois pour toutes
         self._wake_observer = None        # abonnement au réveil du Mac
         self._need_rearm = False          # réarmement de l'écoute à faire dès que possible
+        self._awake_activity = None       # demande « pas de veille » en cours (cf. _keep_awake)
         self._captured = None             # dernière touche captée pendant la capture
         self._stream = None               # flux audio en cours
         self._audio_stats = None          # compteurs livrés par le moteur audio
@@ -2071,6 +2149,19 @@ class VoixFlashApp(rumps.App):
         if interrupted:
             log(f"{len(interrupted)} réunion(s) interrompue(s) retrouvée(s) sur le disque.")
             self._ui_queue.put(("recover_meeting", interrupted))
+
+        # Un import de fichier a-t-il été coupé net ? Son texte partiel est sur le disque.
+        imports = recover_interrupted_imports()
+        if imports:
+            self._ui_queue.put(("history_changed", None))
+            detail = "\n".join(f"• {os.path.basename(p)} ({n} mots)" for p, n in imports)
+            self._ui_queue.put(("info", (
+                "Transcription de fichier interrompue",
+                "VoixFlash s'est fermé pendant la transcription d'un fichier. La partie "
+                "déjà transcrite n'est pas perdue : elle est maintenant dans "
+                "l'historique, et reste dans le dossier « "
+                f"{os.path.basename(TRANSCRIPTS_DIR)} » de Documents :\n\n{detail}\n\n"
+                "Pour avoir la fin, relance l'import du fichier.")))
 
         log(f"{APP_NAME} {APP_VERSION} démarré (modèle demandé : {self._requested_model}).")
         diag_rotate()
@@ -2804,7 +2895,20 @@ class VoixFlashApp(rumps.App):
             self._ui_queue.put(("handsfree", False))
 
     def _start_listener(self):
-        """(Re)démarre l'écoute clavier globale pour la dictée éclair."""
+        """(Re)démarre l'écoute clavier globale pour la dictée éclair.
+
+        Appelable depuis n'importe quel thread : le travail est toujours fait sur le
+        thread principal (cf. KeyListener, la lecture du clavier y est obligatoire)."""
+        if threading.current_thread() is threading.main_thread() or AppHelper is None:
+            self._start_listener_now()
+            return
+        try:
+            AppHelper.callAfter(self._start_listener_now)
+        except Exception as e:
+            log(f"relance de l'écoute (thread principal) : {e}")
+
+    def _start_listener_now(self):
+        """Corps de _start_listener. Thread principal uniquement."""
         if self._listener is not None:
             try:
                 self._listener.stop()
@@ -2812,7 +2916,7 @@ class VoixFlashApp(rumps.App):
                 pass
         self._reset_ptt()                 # on repart d'un état propre
         self._hotkey = parse_hotkey(self.config["hotkey"])
-        self._listener = keyboard.Listener(on_press=self._on_press, on_release=self._on_release)
+        self._listener = KeyListener(on_press=self._on_press, on_release=self._on_release)
         self._listener.daemon = True
         self._listener.start()
 
@@ -3957,6 +4061,24 @@ class VoixFlashApp(rumps.App):
             except Exception as e:
                 log(f"watchdog loop : {e}")
 
+    def _keep_awake(self, busy):
+        """Demande à macOS de ne pas mettre le Mac en veille tant que `busy` est vrai,
+        et lève la demande dès qu'il redevient faux. Appelée toutes les 2 s par les
+        garde-fous : couvre la réunion au micro, sa transcription, l'import de
+        fichier et la reprise d'une réunion interrompue, sans rien ajouter à chacun.
+        L'écran peut toujours s'éteindre ; fermer le capot endort quand même le Mac."""
+        if NSProcessInfo is None:
+            return
+        if busy and self._awake_activity is None:
+            self._awake_activity = NSProcessInfo.processInfo(
+            ).beginActivityWithOptions_reason_(
+                NSActivityUserInitiated, f"{APP_NAME} enregistre ou transcrit")
+            log("Veille du Mac suspendue pendant le travail en cours.")
+        elif not busy and self._awake_activity is not None:
+            NSProcessInfo.processInfo().endActivity_(self._awake_activity)
+            self._awake_activity = None
+            log("Veille du Mac de nouveau autorisée.")
+
     def _watchdogs(self):
         """Petites vérifications de sécurité, sans coût notable au repos.
         ⚠ Exécuté hors du thread principal : ne JAMAIS toucher l'UI directement,
@@ -3981,6 +4103,11 @@ class VoixFlashApp(rumps.App):
                 self._rearm_listener("réveil différé")
         except Exception:
             pass
+        # 1 bis bis) Pas de veille tant qu'on enregistre ou qu'on transcrit.
+        try:
+            self._keep_awake(self._recording or self._transcribing)
+        except Exception as e:
+            log(f"anti-veille : {e}")
         # 1 ter) Battement du journal audio pendant une capture longue. Sur une réunion
         #        d'une heure, c'est la seule trace qui dit si le micro a continué de
         #        livrer du son ou s'il s'est tu en cours de route. Écrit depuis CE

@@ -1,5 +1,22 @@
 # Journal des versions — VoixFlash
 
+## 1.6.1 : plus de transcription coupée par la veille du Mac
+
+- **Le Mac ne s'endort plus pendant le travail.** Tant qu'une réunion s'enregistre ou
+  qu'une transcription tourne (réunion, import de fichier, reprise), VoixFlash demande à
+  macOS de repousser la mise en veille. Sur batterie, un import de deux heures laissé
+  sans y toucher s'arrêtait au bout de quelques minutes. L'écran peut toujours
+  s'éteindre ; fermer le capot endort quand même le Mac.
+- **Le réveil ne fait plus planter l'app.** Au réveil, VoixFlash relance son écoute du
+  clavier. Sur macOS 26, lire la disposition du clavier hors du thread principal
+  fait tuer l'app par le système, sans message ni trace dans le journal : 6 plantages
+  le même jour, tous juste après un réveil, dont deux au milieu d'un import de 2 h 30.
+  La disposition est maintenant lue sur le thread principal.
+- **Un import coupé net se signale au démarrage suivant.** Le texte déjà transcrit
+  (gardé au fil de l'eau dans `import_partiel_*.txt`) est versé dans l'historique, le
+  fichier est renommé `import_interrompu_*.txt`, et une fenêtre dit où il se trouve.
+  Avant, il restait dans le dossier sans que rien ne le signale.
+
 ## 1.6.0 — des réunions lisibles, et un micro qui se signale quand il est mort
 
 - **« Locuteurs attendus » veut enfin dire quelque chose.** Le nombre choisi était
